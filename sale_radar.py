@@ -439,10 +439,120 @@ def renner(g):
     return items, [], f"{RENNER}/c/" + ("feminino" if g == "F" else "masculino")
 
 
+# ------------------------------------------- Magazord (Monteleste, Comp Supply)
+MONTELESTE = "https://www.monteleste.com.br"
+COMPSUPPLY = "https://www.compsupply.com.br"
+
+
+def magazord_sizes(x):
+    ok, out = [], []
+
+    def walk(o):
+        if isinstance(o, dict):
+            if o.get("deri_nome") == "Tamanho":
+                (ok if o.get("estoque") else out).append(str(o.get("derivacao")))
+            else:
+                for v in o.values():
+                    walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(x.get("derivacoesItem"))
+    ok = list(dict.fromkeys(ok))
+    return {"sizes": ok, "sold_out": [n for n in dict.fromkeys(out) if n not in ok]}
+
+
+def magazord(base, g):
+    """Página /sale da loja; os produtos vêm em JSON dentro do HTML (itens: [...])."""
+    items = {}
+    for page in range(1, 21):
+        html = get_text(f"{base}/sale?p={page}")
+        i = html.find("itens: ")
+        if i < 0:
+            break
+        arr, _ = json.JSONDecoder().raw_decode(html[i + 7:])
+        for x in arr:
+            try:
+                price = float(x["valor"])
+                old = float(x["valor_de"]) if x.get("valor_de") else 0
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not old > price:
+                continue
+            items[str(x["codigo"])] = make_item(
+                x.get("titulo") or x["nome"], round(price * 100), round(old * 100),
+                base + x["link"].split("#")[0], x.get("midia_url"), **magazord_sizes(x))
+        if not arr or '<link rel="next"' not in html:
+            break
+    return items, [], f"{base}/sale"
+
+
+# ---------------------------------------------------- The Dust Company (Shoppub)
+DUST = "https://www.thedustcompany.com.br"
+DUST_CATS = ("ofertas", "flashblack")
+DUST_CARD = re.compile(r'<li[^>]*class="[^"]*product-item[^"]*"')
+
+
+def br_cents(txt):
+    return round(float(txt.replace(".", "").replace(",", ".")) * 100)
+
+
+def dust(g):
+    items = {}
+    for cat in DUST_CATS:
+        seen = set()
+        for page in range(1, 31):
+            try:
+                html = get_text(f"{DUST}/categoria/{cat}/?page={page}")
+            except Exception:
+                break
+            new = 0
+            for c in DUST_CARD.split(html)[1:]:
+                sku = re.search(r'data-product-sku="([^"]+)"', c)
+                de = re.search(r'data-preco-de="([^"]+)"', c)
+                por = re.search(r'data-preco-por="([^"]+)"', c)
+                name = re.search(r'data-product-name="([^"]*)"', c)
+                href = re.search(r'href="(/produto/[^"$]+)"', c)
+                if not (sku and de and por and name and href) or sku.group(1) in seen:
+                    continue
+                seen.add(sku.group(1))
+                new += 1
+                old_c, price_c = br_cents(de.group(1)), br_cents(por.group(1))
+                if not old_c > price_c:
+                    continue
+                img = re.search(r'data-src="(https://[^"]+)"', c)
+                items[sku.group(1)] = make_item(
+                    name.group(1), price_c, old_c, DUST + href.group(1),
+                    img.group(1) if img else None, sizes_unverified=True)
+            if new == 0:
+                break
+    return items, [], f"{DUST}/categoria/ofertas/"
+
+
+def dust_sizes(item):
+    html = get_text(item["url"])
+    ok, out = [], []
+    for m in re.finditer(r'<input type="radio"([^>]*)data-variation-name="Tamanho"([^>]*)>\s*'
+                         r'<label([^>]*)>\s*<span>\s*([^<]+?)\s*</span>', html):
+        flags = (m.group(1) + m.group(2) + m.group(3)).lower()
+        (out if ("disabled" in flags or "esgotado" in flags or "indispon" in flags) else ok).append(m.group(4))
+    if not ok and not out:
+        return None
+    return list(dict.fromkeys(ok)), list(dict.fromkeys(out))
+
+
 BASE_STORES = {"Zara": zara, "Bershka": bershka, "H&M": hm, "Youcom": youcom, "C&A": cea,
                "Riachuelo": riachuelo, "Renner": renner}
 # (nome, gênero) -> função. Masculino mantém a chave antiga no estado; feminino ganha " (F)".
 STORES = {(n, g): (lambda f=f, g=g: f(g)) for g in GENDERS for n, f in BASE_STORES.items()}
+
+
+# Lojas só masculinas (pedido do usuário): (nome) -> função(gênero)
+MEN_ONLY = {"The Dust Company": dust,
+            "Monteleste": lambda g: magazord(MONTELESTE, g),
+            "Comp Supply": lambda g: magazord(COMPSUPPLY, g)}
+STORES.update({(n, "M"): (lambda f=f: f("M")) for n, f in MEN_ONLY.items()})
 
 
 def state_key(name, g):
@@ -492,7 +602,8 @@ def youcom_sizes(item):
             [z["name"] for z in sizes if not z.get("available")])
 
 
-SIZE_FETCHERS = {"Zara": zara_sizes, "Bershka": bershka_sizes, "Youcom": youcom_sizes}
+SIZE_FETCHERS = {"Zara": zara_sizes, "Bershka": bershka_sizes, "Youcom": youcom_sizes,
+                 "The Dust Company": dust_sizes}
 
 
 def fill_sizes(name, items):
