@@ -95,7 +95,13 @@ def zara():
 BSK = "https://www.bershka.com/itxrest"
 BSK_STORE = "45109565/40259535"
 BSK_HDR = {"Referer": "https://www.bershka.com/br/h-man.html",
-           "Origin": "https://www.bershka.com"}
+           "Origin": "https://www.bershka.com",
+           # cabecalhos de navegador: sem eles o IP do GitHub toma 403
+           "sec-ch-ua": '"Chromium";v="130", "Google Chrome";v="130"',
+           "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"',
+           "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
+           "Accept": "application/json, text/plain, */*",
+           "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"}
 
 
 def bershka():
