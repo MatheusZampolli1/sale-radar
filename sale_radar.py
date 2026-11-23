@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import time
 import traceback
 import urllib.parse
 import urllib.request
@@ -766,7 +767,9 @@ def main():
         CUR_GENDER[0] = g
         key, title = state_key(name, g), f"{name} {GENDERS[g]}"
         try:
+            t0 = time.time()
             items, cats, home = fn()
+            print(f"  ({title}: coletado em {time.time() - t0:.0f}s)", flush=True)
         except Exception as e:                              # uma loja caída não derruba as outras
             print(f"[{title}] ERRO: {type(e).__name__}: {str(e)[:120]}")
             status[title] = f"ERRO {type(e).__name__}: {str(e)[:60]}"

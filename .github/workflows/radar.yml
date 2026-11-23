@@ -1,5 +1,5 @@
 name: sale-radar
-# Uma rodada longa em laço (checa a cada ~1 min + tempo da coleta) e que se religa sozinha.
+# Cada rodada faz UMA volta nas lojas, publica o estado, e já deixa a próxima rodada agendada.
 # O cron de hora em hora é só rede de segurança caso a corrente quebre.
 on:
   schedule:
@@ -14,14 +14,19 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Laço de checagem (~5h40)
+      - name: Agendar a próxima rodada
         env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run radar.yml
+      - name: Volta de checagem
+        env:
+          PYTHONUNBUFFERED: "1"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_BOT_TOKEN_F: ${{ secrets.TELEGRAM_BOT_TOKEN_F }}
@@ -29,19 +34,15 @@ jobs:
         run: |
           git config user.name "sale-radar"
           git config user.email "sale-radar@users.noreply.github.com"
-          END=$((SECONDS + 20400))
-          while [ $SECONDS -lt $END ]; do
-            python sale_radar.py --skip "The Dust Company,Monteleste,Comp Supply" || true
-            if ! git diff --quiet state.json; then
-              git add state.json
-              git commit -qm "estado"
-              git pull --rebase -q -X theirs || true
-              git push -q || true
-            fi
-            sleep 60
-          done
-      - name: Religar a corrente
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run sale-radar.yml
+          git fetch -q origin master && git reset -q --hard origin/master
+          python sale_radar.py --skip "The Dust Company,Monteleste,Comp Supply" || true
+          if ! git diff --quiet state.json; then
+            git add state.json
+            git commit -qm "estado"
+            for i in 1 2 3; do
+              git pull --rebase -q -X theirs && git push -q && break
+              sleep 3
+            done
+          fi
+      - name: Pausa curta
+        run: sleep 45
