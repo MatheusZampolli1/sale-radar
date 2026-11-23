@@ -18,6 +18,7 @@ import re
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import urllib.parse
 import urllib.request
@@ -877,10 +878,14 @@ def tg_call(token, method, params):
 
 
 def process_updates(state):
-    """Lê os toques nos botões (silenciar / reativar loja) desde a última volta."""
+    """Lê toques em botões (silenciar/reativar) e comandos (/vigiar, /vigiados, /parar, /ajuda)."""
     muted = state.setdefault("muted", [])
     offs = state.setdefault("tg_offset", {})
     seen = set()
+    allowed = set()
+    for g in ("M", "F"):
+        CUR_GENDER[0] = g
+        allowed.add(str(creds()[1]))
     for g in ("M", "F"):
         CUR_GENDER[0] = g
         token, _ = creds()
@@ -890,12 +895,22 @@ def process_updates(state):
         tid = token.split(":")[0]
         try:
             r = tg_call(token, "getUpdates", {"offset": offs.get(tid, 0), "timeout": 0,
-                                              "allowed_updates": json.dumps(["callback_query"])})
+                                              "allowed_updates": json.dumps(["callback_query", "message"])})
         except Exception as e:
             print(f"  (getUpdates falhou: {type(e).__name__})")
             continue
         for u in r.get("result", []):
             offs[tid] = u["update_id"] + 1
+            msg = u.get("message")
+            if msg:                                          # comando de texto
+                chat = dig(msg, "chat", "id")
+                text = (msg.get("text") or "").strip()
+                if str(chat) in allowed and text.startswith("/"):
+                    try:
+                        handle_command(state, token, g, chat, text)
+                    except Exception as e:
+                        print(f"  (comando falhou: {type(e).__name__}: {str(e)[:60]})")
+                continue
             cq = u.get("callback_query") or {}
             data, chat = cq.get("data", ""), dig(cq, "message", "chat", "id")
             try:
@@ -918,6 +933,221 @@ def process_updates(state):
                     tg_call(token, "sendMessage", {"chat_id": chat, "text": f"🔔 {k} reativada."})
             except Exception as e:
                 print(f"  (botão falhou: {type(e).__name__})")
+
+
+# ----------------------------------------------- vigiar uma peça específica
+def _first(l, default=None):
+    return l[0] if l else default
+
+
+def w_zara(url):
+    page = get_json(url.split("?")[0] + "?ajax=true", {
+        "Referer": ZARA + "/", "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin"})
+    prod = page["product"]
+    cols = dig(prod, "detail", "colors") or []
+    col = next((c for c in cols if c.get("sizes")), None) or cols[0]
+    sizes = col.get("sizes", [])
+    return {"name": prod["name"].title(), "price": col.get("price"), "old": col.get("oldPrice"),
+            "ok": [z["name"] for z in sizes if z.get("availability") != "out_of_stock"],
+            "out": [z["name"] for z in sizes if z.get("availability") == "out_of_stock"],
+            "img": dig(col, "xmedia", 0, "extraInfo", "deliveryUrl")}
+
+
+def w_bershka(url):
+    pid = re.search(r"c0p(\d+)", url).group(1)
+    cid = (re.search(r"colorId=(\d+)", url) or [None, None])[1]
+    d = get_json(f"{BSK}/3/catalog/store/{BSK_STORE}/productsArray?productIds={pid}"
+                 f"&languageId=-63&appId=1", BSK_HDR)
+    p = d["products"][0]
+    summ = (p.get("bundleProductSummaries") or [p])[0]
+    cols = (summ.get("detail") or {}).get("colors", [])
+    col = next((c for c in cols if str(c.get("id")) == cid), None) or cols[0]
+    sz = col.get("sizes", [])
+    prices = [to_cents(z["price"]) for z in sz if z.get("price")]
+    olds = [to_cents(z["oldPrice"]) for z in sz if z.get("oldPrice")]
+    vis = [z for z in sz if z.get("isBuyable") and z.get("visibilityValue", "SHOW") == "SHOW"]
+    ok, out = bershka_sizes({"pid": pid, "skus": {str(z["sku"]): z["name"] for z in vis},
+                             "hidden": [z["name"] for z in sz if z not in vis]})
+    return {"name": f"{p.get('name')} — {col.get('name')}", "price": min(prices) if prices else None,
+            "old": min(olds) if olds else None, "ok": ok, "out": out,
+            "img": bsk_image(summ, col.get("id"))}
+
+
+def w_vtex(url, base, check_member):
+    slug = urllib.parse.urlparse(url).path.strip("/").rsplit("/", 1)[0]
+    p = get_json(f"{base}/api/catalog_system/pub/products/search/{slug}/p")[0]
+    it = p["items"][0]
+    off = (it.get("sellers") or [{}])[0].get("commertialOffer", {})
+    price, old = off.get("Price"), off.get("ListPrice")
+    if check_member:                                    # H&M: a API traz o preço de membro
+        m = HM_OFFER.search(get_text(url))
+        if m:
+            price = float(m.group(1))
+    sz = vtex_sizes(p)
+    return {"name": p["productName"], "price": round(price * 100) if price else None,
+            "old": round(old * 100) if old else None, "ok": sz["sizes"], "out": sz["sold_out"],
+            "img": dig(it, "images", 0, "imageUrl")}
+
+
+def w_youcom(url):
+    pid = re.search(r"-p(\d+)", url).group(1)
+    q = ('{ productDetails(id:"%s"){ colorVariations{ name color{ name } price promotionPrice '
+         'sizeVariations{ name available } images{ url } } } }' % pid)
+    cols = you_post(q)["productDetails"]["colorVariations"]
+    c = cols[0]
+    sizes = c["sizeVariations"]
+    promo, price = c.get("promotionPrice"), c.get("price")
+    final = promo if promo else price
+    return {"name": (c.get("name") or "Produto").title(),
+            "price": round(float(final) * 100) if final else None,
+            "old": round(float(price) * 100) if promo and price else None,
+            "ok": [z["name"] for z in sizes if z.get("available")],
+            "out": [z["name"] for z in sizes if not z.get("available")],
+            "img": dig(c, "images", 0, "url")}
+
+
+def w_generic(url):
+    html = get_text(url, RIA_HDR)
+    for blk in re.findall(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
+        try:
+            d = json.loads(blk)
+        except Exception:
+            continue
+        for x in (d if isinstance(d, list) else [d]):
+            if isinstance(x, dict) and x.get("@type") == "Product":
+                o = x.get("offers")
+                o = (o[0] if isinstance(o, list) and o else o) or {}
+                pr = o.get("price") or o.get("lowPrice")
+                img = x.get("image")
+                img = img[0] if isinstance(img, list) and img else img
+                if pr:
+                    return {"name": x.get("name", "Produto"), "price": round(float(pr) * 100),
+                            "old": None, "ok": None, "out": None, "img": norm_img(img)}
+    raise ValueError("não achei o preço nessa página")
+
+
+def watch_fetch(url):
+    host = urllib.parse.urlparse(url).netloc.lower()
+    if "zara.com" in host:
+        return w_zara(url)
+    if "bershka.com" in host:
+        return w_bershka(url)
+    if "hm.com.br" in host:
+        return w_vtex(url, HM, True)
+    if "cea.com.br" in host:
+        return w_vtex(url, CEA, False)
+    if "youcom.com.br" in host:
+        return w_youcom(url)
+    return w_generic(url)
+
+
+HELP = ("🤖 Comandos:\n"
+        "/vigiar <link> [tam=M] [preco=150] — acompanha uma peça. Avisa quando o preço cair, "
+        "quando o tamanho voltar ao estoque e quando chegar no preço alvo.\n"
+        "/vigiados — lista o que está sendo vigiado\n"
+        "/parar <número> — para de vigiar\n"
+        "/ajuda — esta mensagem")
+
+
+def reply(token, chat, text):
+    tg_call(token, "sendMessage", {"chat_id": chat, "text": text, "disable_web_page_preview": "true"})
+
+
+def handle_command(state, token, g, chat, text):
+    parts = text.split()
+    cmd = parts[0].split("@")[0].lower()
+    watch = state.setdefault("watch", [])
+    if cmd in ("/ajuda", "/start", "/help"):
+        reply(token, chat, HELP)
+    elif cmd == "/vigiados":
+        mine = [w for w in watch if str(w["chat"]) == str(chat)]
+        reply(token, chat, "👀 Vigiando:\n" + "\n".join(
+            f"{w['id']}. {w['name']} — {brl(w['last_price'])}"
+            + (f" | tam {w['size']}" if w.get("size") else "")
+            + (f" | alvo {brl(w['target'])}" if w.get("target") else "") for w in mine)
+            if mine else "Nada sendo vigiado. Use /vigiar <link>.")
+    elif cmd == "/parar":
+        ids = [x for x in parts[1:] if x.isdigit()]
+        before = len(watch)
+        watch[:] = [w for w in watch if not (str(w["chat"]) == str(chat) and str(w["id"]) in ids)]
+        reply(token, chat, "🛑 Parei de vigiar." if len(watch) < before else "Não achei esse número. Veja /vigiados.")
+    elif cmd == "/vigiar":
+        url = next((x for x in parts[1:] if x.startswith("http")), None)
+        if not url:
+            return reply(token, chat, "Me mande o link: /vigiar https://... tam=M preco=150")
+        opts = {k.lower(): v for k, v in (x.split("=", 1) for x in parts[1:] if "=" in x and not x.startswith("http"))}
+        size = (opts.get("tam") or opts.get("tamanho") or "").upper() or None
+        target = None
+        if opts.get("preco"):
+            try:
+                target = round(float(opts["preco"].replace(",", ".")) * 100)
+            except ValueError:
+                pass
+        try:
+            d = watch_fetch(url)
+        except Exception as e:
+            return reply(token, chat, f"😕 Não consegui ler esse link ({type(e).__name__}). "
+                                      f"Confira se é a página de uma peça.")
+        nid = max([w["id"] for w in watch] + [0]) + 1
+        watch.append({"id": nid, "url": url, "size": size, "target": target, "chat": chat, "g": g,
+                      "name": d["name"], "last_price": d["price"], "last_ok": d["ok"] or [],
+                      "img": d.get("img")})
+        txt = f"👀 Vigiando #{nid}: {d['name']}\nPreço agora: {brl(d['price'])}"
+        if d.get("old") and d["old"] > (d["price"] or 0):
+            txt += f" (de {brl(d['old'])})"
+        if d["ok"] is not None:
+            txt += "\n📏 Tamanhos: " + (" · ".join(d["ok"]) or "nenhum disponível")
+            if d.get("out"):
+                txt += "\n🚫 Esgotado: " + " · ".join(d["out"])
+        txt += "\nVou avisar quando: o preço cair"
+        if size:
+            txt += f", o tamanho {size} estiver disponível"
+        if target:
+            txt += f", o preço chegar a {brl(target)} ou menos"
+        reply(token, chat, txt + ".")
+    else:
+        reply(token, chat, "Não conheço esse comando.\n" + HELP)
+
+
+def check_watches(state, dry):
+    """Confere as peças vigiadas e avisa mudanças de preço ou de tamanho."""
+    for w in list(state.get("watch", []))[:40]:
+        try:
+            d = watch_fetch(w["url"])
+        except Exception as e:
+            print(f"  (vigia #{w['id']} falhou: {type(e).__name__})")
+            continue
+        price, last = d["price"], w.get("last_price")
+        reasons = []
+        if price and last and price < last:
+            reasons.append(f"🔻 Preço caiu: {brl(last)} → {brl(price)}")
+        if price and w.get("target") and price <= w["target"] and (not last or last > w["target"]):
+            reasons.append(f"🎯 Chegou no preço alvo ({brl(w['target'])})")
+        now_ok = d["ok"] or []
+        if w.get("size") and w["size"] in [x.upper() for x in now_ok] \
+                and w["size"] not in [x.upper() for x in w.get("last_ok", [])]:
+            reasons.append(f"📏 Tamanho {w['size']} disponível!")
+        w["last_price"] = price or last
+        w["last_ok"] = now_ok
+        if not reasons:
+            continue
+        cap = (f"👀 PEÇA VIGIADA #{w['id']}\n{d['name']}\n" + "\n".join(reasons)
+               + f"\nPreço agora: {brl(price)}"
+               + ("\n📏 " + " · ".join(now_ok) if now_ok else "") + f"\n{w['url']}")
+        print(cap.replace(chr(10), " | "))
+        if dry:
+            continue
+        CUR_GENDER[0] = w.get("g", "M")
+        token, _ = creds()
+        img = norm_img(d.get("img") or w.get("img"))
+        try:
+            if not img:
+                raise ValueError("sem imagem")
+            tg_call(token, "sendPhoto", {"chat_id": w["chat"], "photo": img, "caption": cap})
+        except Exception:
+            tg_call(token, "sendMessage", {"chat_id": w["chat"], "text": cap,
+                                           "disable_web_page_preview": "true"})
 
 
 # ---------------------------------------------------------------- filtros
@@ -1033,6 +1263,7 @@ def main():
     status = {}                                            # resumo por loja (visível no state.json)
     n_ok = n_err = 0
 
+    selected = []
     for (name, g), fn in STORES.items():
         if only and only not in name.lower():
             continue
@@ -1040,12 +1271,24 @@ def main():
             continue
         if name.lower() in stores_skip:
             continue
+        selected.append((name, g, fn))
+
+    def timed(fn):
+        t0 = time.time()
+        return fn(), time.time() - t0
+
+    # coleta em PARALELO (cada loja num fio); o envio dos alertas continua em ordem, um por vez
+    t_start = time.time()
+    with ThreadPoolExecutor(max_workers=int(os.environ.get("RADAR_WORKERS", "8"))) as ex:
+        futures = [ex.submit(timed, fn) for _, _, fn in selected]
+    print(f"  (coleta paralela de {len(selected)} lojas em {time.time() - t_start:.0f}s)", flush=True)
+
+    for (name, g, fn), fut in zip(selected, futures):
         CUR_GENDER[0] = g
         key, title = state_key(name, g), f"{name} {GENDERS[g]}"
         try:
-            t0 = time.time()
-            items, cats, home = fn()
-            print(f"  ({title}: coletado em {time.time() - t0:.0f}s)", flush=True)
+            (items, cats, home), dt = fut.result()
+            print(f"  ({title}: coletado em {dt:.0f}s)", flush=True)
         except Exception as e:                              # uma loja caída não derruba as outras
             err = f"{type(e).__name__}: {str(e)[:100]}"
             print(f"[{title}] ERRO: {err}")
@@ -1084,6 +1327,8 @@ def main():
 
     state["hm_checked"] = HM_CACHE
     state["status"] = {**state.get("status", {}), **status}
+    if full_run:
+        check_watches(state, dry)                          # peças vigiadas pelo /vigiar
 
     # resumo diário (uma vez por dia, depois das 9h de Brasília, só em volta completa)
     now = datetime.now(BRT)
