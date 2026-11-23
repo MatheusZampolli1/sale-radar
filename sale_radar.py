@@ -30,8 +30,8 @@ SALE_WORDS = ("SALE", "REBAJA", "PROMO", "OFERTA", "DESCONTO", "OUTLET",
 OFF_WORD = re.compile(r"\bOFF\b")      # "OFF" só como palavra inteira (evita "HOME OFFICE")
 MASS_SALE_MIN = 150     # nº de peças em sale que conta como "sale geral"
 MIN_JUMP_PTS = 5        # desconto precisa subir X pontos para avisar
-MAX_LINES = 12
-MAX_PHOTOS = 8
+MAX_LINES = 15
+MAX_PHOTOS = 15
 GENDERS = {"M": "Homem", "F": "Mulher"}
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
@@ -164,6 +164,28 @@ BSK_HDR = {"Referer": "https://www.bershka.com/br/h-man.html",
            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"}
 
 
+BSK_IMG_PREF = ("b1", "s1", "a1t", "a1", "p1")      # "r1" é a amostra de tecido (borrada)
+
+
+def bsk_image(summary, col_id):
+    """Foto principal da COR (não a amostra de tecido)."""
+    sets = dig(summary, "detail", "xmedia") or []
+    xs = next((x for x in sets
+               if str(x.get("colorCode") or str(x.get("path", "")).strip("/")) == str(col_id)), None)
+    if xs is None and sets:
+        xs = sets[0]
+    if not xs:
+        return None
+    medias = [m for it in xs.get("xmediaItems", []) for m in it.get("medias", [])
+              if dig(m, "extraInfo", "deliveryUrl")]
+    by_name = {dig(m, "extraInfo", "originalName"): m for m in medias}
+    for n in BSK_IMG_PREF:
+        if n in by_name:
+            return by_name[n]["extraInfo"]["deliveryUrl"]
+    rest = [m for m in medias if not str(dig(m, "extraInfo", "originalName") or "").startswith("r")]
+    return dig((rest or medias or [None])[0], "extraInfo", "deliveryUrl")
+
+
 def bershka(g):
     tree = get_json(f"{BSK}/2/catalog/store/{BSK_STORE}/category?languageId=-63&appId=1", BSK_HDR)
     top = next(c for c in tree["categories"] if c.get("nameEn") == BSK_TOP[g])
@@ -188,7 +210,9 @@ def bershka(g):
                      f"&languageId=-63&appId=1", BSK_HDR)
         for p in d.get("products", []):
             for s in p.get("bundleProductSummaries") or [p]:
-                for col in (s.get("detail") or {}).get("colors", []):
+                cols = (s.get("detail") or {}).get("colors", [])
+                col_names = [c.get("name") for c in cols]
+                for col in cols:
                     prices = [(to_cents(z["price"]), to_cents(z["oldPrice"]))
                               for z in col.get("sizes", []) if z.get("price") and z.get("oldPrice")]
                     if not prices:
@@ -197,11 +221,14 @@ def bershka(g):
                     if old > price:
                         visible = [z for z in col.get("sizes", [])
                                    if z.get("isBuyable") and z.get("visibilityValue", "SHOW") == "SHOW"]
+                        cname = col.get("name") or ""
+                        if col_names.count(col.get("name")) > 1:      # duas cores com o mesmo nome
+                            cname += f" (cód. {col.get('id')})"
+                        label = f"{p.get('name') or '?'} — {cname}" if cname else (p.get("name") or "?")
                         items[f"{p['id']}-{col.get('id')}"] = make_item(
-                            p.get("name") or col.get("name", "?"), price, old,
-                            f"https://www.bershka.com/br/c0p{p['id']}.html",
-                            dig(s, "detail", "xmedia", 0, "xmediaItems", 0, "medias", 0,
-                                "extraInfo", "deliveryUrl"),
+                            label, price, old,
+                            f"https://www.bershka.com/br/c0p{p['id']}.html?colorId={col.get('id')}",
+                            bsk_image(s, col.get("id")),
                             pid=p["id"],
                             skus={str(z["sku"]): z["name"] for z in visible},
                             hidden=[z["name"] for z in col.get("sizes", []) if z not in visible])
@@ -438,7 +465,7 @@ def renner(g):
             img = (a.get("prop.product.largeImageUrl") or [None])[0]
             items[key] = make_item(
                 a["prop.product.displayName"][0], round(price * 100), round(old * 100),
-                RENNER + a["prop.product.url"][0], ("https:" + img) if img else None,
+                RENNER + a["prop.product.url"][0], norm_img(img),
                 sizes=sizes, sold_out=[], sizes_unverified=True)
     return items, [], f"{RENNER}/c/" + ("feminino" if g == "F" else "masculino")
 
@@ -689,17 +716,121 @@ def creds():
     return os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
 
 
-def tg(method, params, strict=False):
+def tg(method, params, strict=False, quiet=False):
     token, chat = creds()
     body = urllib.parse.urlencode({"chat_id": chat, **params}).encode()
+    for attempt in (1, 2):
+        try:
+            urllib.request.urlopen(f"https://api.telegram.org/bot{token}/{method}", body, timeout=30)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 1:           # limite de envios: espera e tenta de novo
+                try:
+                    wait = json.loads(e.read().decode()).get("parameters", {}).get("retry_after", 5)
+                except Exception:
+                    wait = 5
+                time.sleep(min(int(wait) + 1, 30))
+                continue
+            if strict:
+                raise
+            if not quiet:
+                print(f"  (telegram {method} falhou: HTTP {e.code})")
+            return False
+        except Exception as e:
+            if strict:
+                raise
+            if not quiet:
+                print(f"  (telegram {method} falhou: {type(e).__name__})")
+            return False
+    return False
+
+
+# ------------------------------------------------ foto garantida em todo alerta
+def norm_img(u):
+    if not u:
+        return None
+    u = str(u).strip()
+    while u.startswith("https:https:") or u.startswith("https:http"):
+        u = u[6:]
+    if u.startswith("//"):
+        u = "https:" + u
+    return u if u.startswith("http") else None
+
+
+def to_jpeg(data):
+    """Telegram aceita JPEG/PNG/GIF; converte WEBP/AVIF se o Pillow estiver instalado."""
+    if data[:2] == b"\xff\xd8" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:4] == b"GIF8":
+        return data
     try:
-        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/{method}", body, timeout=30)
+        import io
+        from PIL import Image
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=88)
+        return buf.getvalue()
+    except Exception:
+        return data
+
+
+def fetch_image(url, referer=None):
+    h = {"User-Agent": UA, "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+         "Accept-Language": "pt-BR,pt;q=0.9"}
+    if referer:
+        h["Referer"] = referer
+    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=40) as r:
+        return to_jpeg(r.read(12_000_000))
+
+
+def page_image(url):
+    """og:image da página do produto (quando a lista não trouxe imagem utilizável)."""
+    try:
+        html = get_text(url, RIA_HDR)
+    except Exception:
+        return None
+    m = (re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html)
+         or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image', html))
+    return norm_img(m.group(1)) if m else None
+
+
+def tg_upload_photo(photo, caption_text, markup):
+    token, chat = creds()
+    bd = "----radar" + str(int(time.time() * 1000))
+    parts = []
+
+    def field(n, v):
+        parts.append(f'--{bd}\r\nContent-Disposition: form-data; name="{n}"\r\n\r\n{v}\r\n'.encode("utf8"))
+
+    field("chat_id", chat)
+    field("caption", caption_text)
+    if markup:
+        field("reply_markup", markup)
+    parts.append(f'--{bd}\r\nContent-Disposition: form-data; name="photo"; filename="foto.jpg"\r\n'
+                 f'Content-Type: image/jpeg\r\n\r\n'.encode())
+    parts.append(photo)
+    parts.append(f"\r\n--{bd}--\r\n".encode())
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendPhoto",
+                                 data=b"".join(parts),
+                                 headers={"Content-Type": f"multipart/form-data; boundary={bd}"})
+    urllib.request.urlopen(req, timeout=60)
+
+
+def send_photo(it, cap, mk):
+    """Tenta: link da imagem -> baixar e enviar o arquivo -> imagem da página do produto."""
+    extra = {"reply_markup": mk} if mk else {}
+    img = norm_img(it.get("img"))
+    if img and (tg("sendPhoto", {"photo": img, "caption": cap, **extra}, quiet=True)
+                or tg("sendPhoto", {"photo": img, "caption": cap}, quiet=True)):
         return True
-    except Exception as e:
-        if strict:
-            raise
-        print(f"  (telegram {method} falhou: {type(e).__name__})")
-        return False
+    for src in dict.fromkeys([img, None]):
+        src = src or page_image(it["url"])
+        if not src:
+            continue
+        try:
+            tg_upload_photo(fetch_image(src, it["url"]), cap, mk)
+            return True
+        except Exception as e:
+            print(f"  (foto por upload falhou: {type(e).__name__})")
+    return False
 
 
 def buttons(it):
@@ -726,14 +857,11 @@ def send(msg, dry):
     for it in msg.get("photos", []):
         cap = caption(it)
         mk = buttons(it)
-        extra = {"reply_markup": mk} if mk else {}
-        sent = False
-        if it.get("img"):
-            sent = (tg("sendPhoto", {"photo": it["img"], "caption": cap, **extra})
-                    or tg("sendPhoto", {"photo": it["img"], "caption": cap}))
-        if not sent:                                    # sem foto: manda só o texto
-            tg("sendMessage", {"text": cap, "disable_web_page_preview": "true", **extra}) \
+        if not send_photo(it, cap, mk):                 # último recurso: só o texto
+            tg("sendMessage", {"text": cap, "disable_web_page_preview": "true",
+                               **({"reply_markup": mk} if mk else {})}) \
                 or tg("sendMessage", {"text": cap})
+        time.sleep(0.4)                                 # respeita o limite de envios do Telegram
 
 
 def notify_admin(text, dry):
@@ -862,8 +990,8 @@ def compare(name, title, home, items, cats, prev, hist, skey):
                 msg += f", {len(cand) - n_new} com desconto maior"
             shown = cand[:MAX_LINES]
             fill_sizes(name, shown)
-            photos = [i for i in shown if i.get("img")][:MAX_PHOTOS]
-            sem_foto = [i for i in shown if i not in photos]
+            photos = shown[:MAX_PHOTOS]
+            sem_foto = shown[MAX_PHOTOS:]
             if sem_foto:
                 msg += "\n\n" + "\n".join(fmt(i) for i in sem_foto)
             if len(cand) > len(shown):
