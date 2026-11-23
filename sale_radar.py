@@ -1,28 +1,31 @@
-"""Sale Radar — avisa no Telegram quando a Zara (masculino) coloca peças em sale.
+"""Sale Radar — avisa no Telegram quando lojas (masculino) colocam peças em sale.
+
+Lojas: Zara, Bershka, H&M (e Youcom quando a fonte de dados for mapeada).
 
 Uso:
     python sale_radar.py            # roda uma checagem
-    python sale_radar.py --dry      # não envia nada, só imprime
+    python sale_radar.py --dry      # não envia nada nem salva estado
 
 Variáveis (arquivo .env ou ambiente): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
 import gzip
 import json
 import os
+import re
 import sys
+import traceback
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).parent
 STATE = ROOT / "state.json"
-BASE = "https://www.zara.com/br/pt"
-MEN_KEY = "W2025-HOMBRE"          # categoria "HOMEM" da Zara
-ALL_PRODUCTS_ID = 2510572          # HOMEM > VER TUDO
-SALE_WORDS = ("SALE", "REBAJA", "PROMO", "OFERTA", "DESCONTO", "OUTLET")
-MASS_SALE_MIN = 150                # nº de peças em sale que conta como "sale geral"
-MIN_JUMP_PTS = 5                   # desconto precisa subir X pontos para avisar
-MAX_LINES = 15
+SALE_WORDS = ("SALE", "REBAJA", "PROMO", "OFERTA", "DESCONTO", "OUTLET",
+              "SPECIAL PRICE", "PREÇOS ESPECIAIS", "LIQUIDA")
+OFF_WORD = re.compile(r"OFF")      # "OFF" só como palavra inteira (evita "HOME OFFICE")
+MASS_SALE_MIN = 150     # nº de peças em sale que conta como "sale geral"
+MIN_JUMP_PTS = 5        # desconto precisa subir X pontos para avisar
+MAX_LINES = 12
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
@@ -36,63 +39,151 @@ def load_env():
                 os.environ.setdefault(k.strip(), v.strip())
 
 
-def get_json(url):
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UA, "Accept": "*/*", "Accept-Language": "pt-BR,pt;q=0.9",
-        "Accept-Encoding": "gzip", "Connection": "close"})
-    with urllib.request.urlopen(req, timeout=60) as r:
+def get_json(url, extra=None):
+    headers = {"User-Agent": UA, "Accept": "application/json, */*",
+               "Accept-Language": "pt-BR,pt;q=0.9", "Accept-Encoding": "gzip",
+               "Connection": "close"}
+    headers.update(extra or {})
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
         data = r.read()
         if r.headers.get("Content-Encoding") == "gzip":
             data = gzip.decompress(data)
     return json.loads(data.decode("utf8"))
 
 
-def sale_categories():
-    """Categorias do menu masculino cujo nome/chave sugere promoção."""
-    tree = get_json(f"{BASE}/categories?ajax=true")
-    men = next(c for c in tree["categories"] if c.get("key") == MEN_KEY)
-    found = []
+def is_sale_label(text):
+    t = (text or "").upper()
+    return any(w in t for w in SALE_WORDS) or bool(OFF_WORD.search(t))
+
+
+def make_item(name, price, old, url):
+    return {"name": name.title(), "price": price, "old": old,
+            "pct": round((1 - price / old) * 100), "url": url}
+
+
+# ---------------------------------------------------------------- Zara
+ZARA = "https://www.zara.com/br/pt"
+
+
+def zara():
+    tree = get_json(f"{ZARA}/categories?ajax=true")
+    men = next(c for c in tree["categories"] if c.get("key") == "W2025-HOMBRE")
+    cats = []
 
     def walk(c):
-        label = (c.get("key", "") + " " + (c.get("name") or "")).upper()
-        if c is not men and any(w in label for w in SALE_WORDS):
-            found.append({"id": c["id"], "name": c.get("name") or c.get("key")})
+        if c is not men and is_sale_label(c.get("key", "") + " " + (c.get("name") or "")):
+            cats.append({"id": c["id"], "name": c.get("name") or c.get("key")})
         for s in c.get("subcategories", []):
             walk(s)
 
     walk(men)
-    return found
+    items = {}
+    for cid in dict.fromkeys([2510572] + [c["id"] for c in cats]):   # 2510572 = HOMEM > VER TUDO
+        data = get_json(f"{ZARA}/category/{cid}/products?ajax=true")
+        for g in data.get("productGroups", []):
+            for e in g.get("elements", []):
+                for c in e.get("commercialComponents", []):
+                    price, old = c.get("price"), c.get("oldPrice")
+                    if c.get("id") and price and old and old > price:
+                        seo = c.get("seo", {})
+                        url = f"{ZARA}/{seo.get('keyword', 'x')}-p{seo.get('seoProductId', '')}.html"
+                        items[str(c["id"])] = make_item(c.get("name", "?"), price, old, url)
+    return items, cats, f"{ZARA}/"
 
 
-def products(category_id):
-    data = get_json(f"{BASE}/category/{category_id}/products?ajax=true")
-    for g in data.get("productGroups", []):
-        for e in g.get("elements", []):
-            for c in e.get("commercialComponents", []):
-                if c.get("id") and c.get("price"):
-                    yield c
+# ------------------------------------------------------------- Bershka
+BSK = "https://www.bershka.com/itxrest"
+BSK_STORE = "45109565/40259535"
+BSK_HDR = {"Referer": "https://www.bershka.com/br/h-man.html",
+           "Origin": "https://www.bershka.com"}
 
 
+def bershka():
+    tree = get_json(f"{BSK}/2/catalog/store/{BSK_STORE}/category?languageId=-300&appId=1", BSK_HDR)
+    men = next(c for c in tree["categories"] if c.get("nameEn") == "MEN" or c.get("name") == "MEN")
+    cats = []
+
+    def walk(c):
+        if c is not men and is_sale_label(f"{c.get('name', '')} {c.get('nameEn', '')}"):
+            cats.append({"id": c["id"], "name": c.get("name")})
+        for s in c.get("subcategories", []):
+            walk(s)
+
+    walk(men)
+    ids = []
+    for c in cats:
+        d = get_json(f"{BSK}/3/catalog/store/{BSK_STORE}/category/{c['id']}/product"
+                     f"?showProducts=false&languageId=-300&appId=1", BSK_HDR)
+        ids += [i for i in d.get("productIds", []) if i not in ids]
+    items = {}
+    for i in range(0, len(ids), 20):
+        chunk = ",".join(map(str, ids[i:i + 20]))
+        d = get_json(f"{BSK}/3/catalog/store/{BSK_STORE}/productsArray?productIds={chunk}"
+                     f"&languageId=-300&appId=1", BSK_HDR)
+        for p in d.get("products", []):
+            for s in p.get("bundleProductSummaries") or [p]:
+                for col in (s.get("detail") or {}).get("colors", []):
+                    prices = [(int(z["price"]) // 1000, int(z["oldPrice"]) // 1000)
+                              for z in col.get("sizes", []) if z.get("price") and z.get("oldPrice")]
+                    if not prices:
+                        continue
+                    price, old = min(prices)
+                    if old > price:
+                        url = f"https://www.bershka.com/br/{p.get('name', 'x')}-c0p{p['id']}.html"
+                        items[f"{p['id']}-{col.get('id')}"] = make_item(
+                            p.get("name") or col.get("name", "?"), price, old,
+                            f"https://www.bershka.com/br/c0p{p['id']}.html")
+    return items, cats, "https://www.bershka.com/br/h-man.html"
+
+
+# ----------------------------------------------------------------- H&M
+HM = "https://www.hm.com.br"
+HM_MEN = 2069073889
+
+
+def hm():
+    tree = get_json(f"{HM}/api/catalog_system/pub/category/tree/3")
+    cats = []
+
+    def walk(c, top):
+        if not top and is_sale_label(c.get("name")):
+            cats.append({"id": c["id"], "name": c["name"]})
+        for s in c.get("children", []):
+            walk(s, False)
+
+    for c in tree:
+        if c["id"] == HM_MEN:
+            walk(c, True)
+        elif is_sale_label(c.get("name")):      # categoria de promoção no topo do site
+            cats.append({"id": c["id"], "name": c["name"]})
+    items = {}
+    for cid in dict.fromkeys([HM_MEN] + [c["id"] for c in cats]):
+        for start in range(0, 2500, 50):
+            page = get_json(f"{HM}/api/catalog_system/pub/products/search?fq=C:/{cid}/"
+                            f"&_from={start}&_to={start + 49}")
+            for p in page:
+                for it in p.get("items", [])[:1]:
+                    o = (it.get("sellers") or [{}])[0].get("commertialOffer", {})
+                    price, old = o.get("Price"), o.get("ListPrice")
+                    if price and old and old > price:
+                        items[str(p["productId"])] = make_item(
+                            p["productName"], round(price * 100), round(old * 100), p["link"])
+            if len(page) < 50:
+                break
+    return items, cats, f"{HM}/masculino"
+
+
+STORES = {"Zara": zara, "Bershka": bershka, "H&M": hm}
+
+
+# --------------------------------------------------------- notificação
 def brl(cents):
     return f"R$ {cents / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def collect_sale_items(category_ids):
-    items = {}
-    for cid in category_ids:
-        for c in products(cid):
-            old, price = c.get("oldPrice"), c["price"]
-            if old and old > price:
-                seo = c.get("seo", {})
-                url = f"{BASE}/{seo.get('keyword', 'x')}-p{seo.get('seoProductId', '')}.html"
-                items[str(c["id"])] = {
-                    "name": c.get("name", "?").title(),
-                    "price": price,
-                    "old": old,
-                    "pct": round((1 - price / old) * 100),
-                    "url": url,
-                }
-    return items
+def fmt(item):
+    return (f"• {item['name']} — {brl(item['price'])} "
+            f"(de {brl(item['old'])}, -{item['pct']}%)\n  {item['url']}")
 
 
 def send(text, dry):
@@ -107,56 +198,65 @@ def send(text, dry):
     urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", body, timeout=30)
 
 
-def fmt(item):
-    return f"• {item['name']} — {brl(item['price'])} (de {brl(item['old'])}, -{item['pct']}%)\n  {item['url']}"
+def compare(store, home, items, cats, prev):
+    """Devolve (mensagens, primeira_vez)."""
+    first = prev is None
+    prev = prev or {}
+    old_items = prev.get("items", {})
+    old_cats = {str(c["id"]) for c in prev.get("categories", [])}
+    msgs = []
+    if first:
+        return msgs, True
+    new_cats = [c for c in cats if str(c["id"]) not in old_cats]
+    if new_cats:
+        msgs.append(f"🚨 {store} Homem abriu área de promoção: "
+                    f"{', '.join(c['name'] for c in new_cats)}\n{home}")
+    if len(items) >= MASS_SALE_MIN and len(old_items) < MASS_SALE_MIN:
+        msgs.append(f"🔥 SALE GERAL na {store} Homem: {len(items)} peças com desconto agora!\n{home}")
+    novos = sorted((i for k, i in items.items() if k not in old_items), key=lambda i: -i["pct"])
+    subiu = [i for k, i in items.items()
+             if k in old_items and i["pct"] - old_items[k]["pct"] >= MIN_JUMP_PTS]
+    if novos or subiu:
+        msg = f"🛍️ {store} Homem: {len(novos)} peça(s) nova(s) em sale"
+        if subiu:
+            msg += f", {len(subiu)} com desconto maior"
+        msg += "\n\n" + "\n".join(fmt(i) for i in (novos + subiu)[:MAX_LINES])
+        extra = len(novos) + len(subiu) - MAX_LINES
+        if extra > 0:
+            msg += f"\n… e mais {extra}"
+        msgs.append(msg)
+    return msgs, False
 
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     dry = "--dry" in sys.argv
     load_env()
-    cats = sale_categories()
-    cat_ids = [ALL_PRODUCTS_ID] + [c["id"] for c in cats]
-    items = collect_sale_items(dict.fromkeys(cat_ids))
+    state = json.loads(STATE.read_text(encoding="utf8")) if STATE.exists() else {}
+    if "items" in state:                                   # formato antigo (só Zara)
+        state = {"stores": {"Zara": state}}
+    stores = state.setdefault("stores", {})
 
-    first_run = not STATE.exists()
-    old = json.loads(STATE.read_text(encoding="utf8")) if not first_run else {}
-    old_items = old.get("items", {})
-    old_cats = {str(c["id"]) for c in old.get("categories", [])}
-
-    messages = []
-    new_cats = [c for c in cats if str(c["id"]) not in old_cats]
-    if new_cats and not first_run:
-        names = ", ".join(c["name"] for c in new_cats)
-        messages.append(f"🚨 Zara Homem abriu uma área de promoção: {names}\n{BASE}/")
-    if len(items) >= MASS_SALE_MIN and len(old_items) < MASS_SALE_MIN and not first_run:
-        messages.append(f"🔥 SALE GERAL na Zara Homem: {len(items)} peças com desconto agora!")
-
-    novos = [i for k, i in items.items() if k not in old_items]
-    subiu = [i for k, i in items.items()
-             if k in old_items and i["pct"] - old_items[k]["pct"] >= MIN_JUMP_PTS]
-    if not first_run and (novos or subiu):
-        novos.sort(key=lambda i: -i["pct"])
-        linhas = [fmt(i) for i in novos[:MAX_LINES]]
-        msg = f"🛍️ Zara Homem: {len(novos)} peça(s) nova(s) em sale"
-        if subiu:
-            msg += f", {len(subiu)} com desconto maior"
-        msg += "\n\n" + "\n".join(linhas)
-        if len(novos) > MAX_LINES:
-            msg += f"\n… e mais {len(novos) - MAX_LINES}"
-        messages.append(msg)
-
-    for m in messages:
-        send(m, dry)
-    if first_run:
-        print(f"Primeira execução: {len(items)} peças em sale memorizadas (sem alerta). "
-              f"Áreas de promoção: {[c['name'] for c in cats] or 'nenhuma'}.")
-    elif not messages:
-        print(f"Sem novidades. {len(items)} peças em sale.")
+    for name, fn in STORES.items():
+        try:
+            items, cats, home = fn()
+        except Exception as e:                              # uma loja caída não derruba as outras
+            print(f"[{name}] ERRO: {type(e).__name__}: {str(e)[:120]}")
+            if os.environ.get("RADAR_DEBUG"):
+                traceback.print_exc()
+            continue
+        msgs, first = compare(name, home, items, cats, stores.get(name))
+        for m in msgs:
+            send(m, dry)
+        areas = [c["name"] for c in cats] or "nenhuma"
+        if first:
+            print(f"[{name}] 1ª execução: {len(items)} peças em sale memorizadas. Áreas: {areas}")
+        elif not msgs:
+            print(f"[{name}] sem novidades ({len(items)} em sale)")
+        stores[name] = {"items": items, "categories": cats}
 
     if not dry:
-        STATE.write_text(json.dumps({"items": items, "categories": cats},
-                                    ensure_ascii=False), encoding="utf8")
+        STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf8")
 
 
 if __name__ == "__main__":
