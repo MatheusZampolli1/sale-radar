@@ -30,8 +30,8 @@ SALE_WORDS = ("SALE", "REBAJA", "PROMO", "OFERTA", "DESCONTO", "OUTLET",
 OFF_WORD = re.compile(r"\bOFF\b")      # "OFF" só como palavra inteira (evita "HOME OFFICE")
 MASS_SALE_MIN = 150     # nº de peças em sale que conta como "sale geral"
 MIN_JUMP_PTS = 5        # desconto precisa subir X pontos para avisar
-MAX_LINES = 15
-MAX_PHOTOS = 15
+MAX_LINES = 40          # peças (cada uma com foto) por loja a cada volta; o resto sai nas voltas seguintes
+MAX_PHOTOS = 40
 GENDERS = {"M": "Homem", "F": "Mulher"}
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
@@ -861,7 +861,7 @@ def send(msg, dry):
             tg("sendMessage", {"text": cap, "disable_web_page_preview": "true",
                                **({"reply_markup": mk} if mk else {})}) \
                 or tg("sendMessage", {"text": cap})
-        time.sleep(0.4)                                 # respeita o limite de envios do Telegram
+        time.sleep(3.2 if str(creds()[1]).startswith("-") else 1.2)   # limite do Telegram (~20/min em grupo)
 
 
 def notify_admin(text, dry):
@@ -963,6 +963,7 @@ def compare(name, title, home, items, cats, prev, hist, skey):
     for k, i in items.items():
         i["k"], i["skey"] = k, skey
     msgs = []
+    deferred = set()                                   # peças que ficam para a próxima volta
     if not first:
         tag = f"🏬 {name.upper()} · {title[len(name) + 1:].upper()}"     # loja em destaque
         new_cats = [c for c in cats if str(c["id"]) not in old_cats]
@@ -995,13 +996,14 @@ def compare(name, title, home, items, cats, prev, hist, skey):
             if sem_foto:
                 msg += "\n\n" + "\n".join(fmt(i) for i in sem_foto)
             if len(cand) > len(shown):
-                msg += f"\n… e mais {len(cand) - len(shown)}"
+                msg += f"\n⏳ Mais {len(cand) - len(shown)} peça(s) saem nas próximas voltas."
+                deferred.update(i["k"] for i in cand[len(shown):])
             NOVOS_COUNT[0] += len(cand)
             msgs.append({"text": msg, "photos": photos})
     for k, i in items.items():                         # atualiza o menor preço visto
         old = hist.get(k)
         hist[k] = min(old, i["price"]) if old else i["price"]
-    return msgs, first
+    return msgs, first, deferred
 
 
 def main():
@@ -1063,8 +1065,9 @@ def main():
                 notify_admin(f"✅ {title} voltou a funcionar.", dry)
             health[title] = {"fails": 0, "alerted": False}
         n_ok += 1
-        msgs, first = compare(name, title, home, items, cats, stores.get(key),
-                              hist_all.setdefault(key, {}), key)
+        prev_items = (stores.get(key) or {}).get("items", {})
+        msgs, first, deferred = compare(name, title, home, items, cats, stores.get(key),
+                                        hist_all.setdefault(key, {}), key)
         if key in muted:
             msgs = []                                       # loja silenciada pelo botão
         for m in msgs:
@@ -1074,7 +1077,9 @@ def main():
             print(f"[{title}] 1ª execução: {len(items)} peças em sale memorizadas. Áreas: {areas}")
         elif not msgs:
             print(f"[{title}] sem novidades ({len(items)} em sale)")
-        stores[key] = {"items": items, "categories": cats}
+        keep = {k: v for k, v in items.items() if k not in deferred}      # adiadas: não marca como vistas
+        keep.update({k: prev_items[k] for k in deferred if k in prev_items})
+        stores[key] = {"items": keep, "categories": cats}
         status[title] = len(items)
 
     state["hm_checked"] = HM_CACHE
