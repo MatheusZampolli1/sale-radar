@@ -31,7 +31,7 @@ jobs:
           git config user.email "sale-radar@users.noreply.github.com"
           END=$((SECONDS + 20400))
           while [ $SECONDS -lt $END ]; do
-            python sale_radar.py || true
+            python sale_radar.py --skip "The Dust Company,Monteleste,Comp Supply" || true
             if ! git diff --quiet state.json; then
               git add state.json
               git commit -qm "estado"

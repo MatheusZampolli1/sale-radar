@@ -6,6 +6,8 @@ Uso:
     python sale_radar.py                    # roda uma checagem
     python sale_radar.py --dry              # não envia nada nem salva estado
     python sale_radar.py --only "C&A"       # só lojas cujo nome contém o texto
+    python sale_radar.py --stores "A,B"     # só essas lojas (nome exato); --skip "A,B" pula essas
+    python sale_radar.py --state arq.json   # usa outro arquivo de memória
 
 Variáveis (arquivo .env ou ambiente): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
@@ -739,9 +741,15 @@ def compare(name, title, home, items, cats, prev):
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     dry = "--dry" in sys.argv
-    only = sys.argv[sys.argv.index("--only") + 1].lower() if "--only" in sys.argv else None
+    def arg(flag):
+        return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else None
+
+    only = (arg("--only") or "").lower() or None
+    stores_only = {x.strip().lower() for x in (arg("--stores") or "").split(",") if x.strip()}
+    stores_skip = {x.strip().lower() for x in (arg("--skip") or "").split(",") if x.strip()}
+    state_path = Path(arg("--state")) if arg("--state") else STATE
     load_env()
-    state = json.loads(STATE.read_text(encoding="utf8")) if STATE.exists() else {}
+    state = json.loads(state_path.read_text(encoding="utf8")) if state_path.exists() else {}
     if "items" in state:                                   # formato antigo (só Zara)
         state = {"stores": {"Zara": state}}
     stores = state.setdefault("stores", {})
@@ -750,6 +758,10 @@ def main():
 
     for (name, g), fn in STORES.items():
         if only and only not in name.lower():
+            continue
+        if stores_only and name.lower() not in stores_only:
+            continue
+        if name.lower() in stores_skip:
             continue
         CUR_GENDER[0] = g
         key, title = state_key(name, g), f"{name} {GENDERS[g]}"
@@ -775,7 +787,7 @@ def main():
     state["hm_checked"] = HM_CACHE
     state["status"] = {**state.get("status", {}), **status}
     if not dry:
-        STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf8")
+        state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf8")
 
 
 if __name__ == "__main__":
