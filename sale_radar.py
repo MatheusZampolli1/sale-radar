@@ -112,6 +112,7 @@ def fmt(item):
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     dry = "--dry" in sys.argv
     load_env()
     cats = sale_categories()
