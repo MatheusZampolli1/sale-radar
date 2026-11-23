@@ -18,6 +18,7 @@ import re
 import sys
 import time
 import traceback
+from datetime import datetime, timedelta, timezone
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -611,11 +612,19 @@ SIZE_FETCHERS = {"Zara": zara_sizes, "Bershka": bershka_sizes, "Youcom": youcom_
                  "The Dust Company": dust_sizes}
 
 
+FILLED = set()          # peças cujo tamanho já foi consultado nesta volta
+NOVOS_COUNT = [0]       # peças avisadas (para o resumo diário)
+CONFIG = {}             # config.json (filtros pessoais)
+BRT = timezone(timedelta(hours=-3))
+FILTER_CAP = 60         # máximo de peças consultadas por loja quando há filtro de tamanho
+
+
 def fill_sizes(name, items):
     """Zara, Bershka e Youcom: consulta o estoque real só das peças que vão no alerta."""
     fetch = SIZE_FETCHERS.get(name)
     for it in items:
-        if fetch:
+        if fetch and id(it) not in FILLED:
+            FILLED.add(id(it))
             it["sizes"], it["sold_out"] = None, None     # nunca reaproveita tamanho velho
             try:
                 res = fetch(it)
@@ -644,19 +653,29 @@ def brl(cents):
     return f"R$ {cents / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def price_note(i):
+    pm = i.get("prev_min")
+    if not pm:
+        return ""
+    if i["price"] < pm:
+        return f"🔻 Menor preço que já vi (antes {brl(pm)})"
+    if i["price"] > pm:
+        return f"ℹ️ Já vi mais barato: {brl(pm)}"
+    return ""
+
+
 def fmt(item):
-    line = sizes_line(item)
+    extra = "".join(f"  {x.replace(chr(10), chr(10) + '  ')}\n"
+                    for x in (price_note(item), sizes_line(item)) if x)
     return (f"• {item['name']} — {brl(item['price'])} "
-            f"(de {brl(item['old'])}, -{item['pct']}%)\n"
-            + (f"  {line.replace(chr(10), chr(10) + '  ')}\n" if line else "") + f"  {item['url']}")
+            f"(de {brl(item['old'])}, -{item['pct']}%)\n" + extra + f"  {item['url']}")
 
 
 def caption(item):
-    line = sizes_line(item)
     head = f"{item['store']}\n" if item.get("store") else ""
+    extra = "".join(f"{x}\n" for x in (price_note(item), sizes_line(item)) if x)
     return (head + f"{item['name']}\n{brl(item['price'])} "
-            f"(de {brl(item['old'])}, -{item['pct']}%)\n"
-            + (f"{line}\n" if line else "") + item["url"])
+            f"(de {brl(item['old'])}, -{item['pct']}%)\n" + extra + item["url"])
 
 
 CUR_GENDER = ["M"]      # gênero da loja que está sendo processada (define o chat do Telegram)
@@ -683,6 +702,15 @@ def tg(method, params, strict=False):
         return False
 
 
+def buttons(it):
+    row = []
+    if str(it.get("url", "")).startswith("http"):
+        row.append({"text": "🔗 Abrir", "url": it["url"]})
+    if it.get("skey"):
+        row.append({"text": "🔕 Silenciar loja", "callback_data": "mute:" + it["skey"]})
+    return json.dumps({"inline_keyboard": [row]}) if row else None
+
+
 def send(msg, dry):
     if isinstance(msg, str):
         msg = {"text": msg}
@@ -697,51 +725,161 @@ def send(msg, dry):
     tg("sendMessage", {"text": msg["text"], "disable_web_page_preview": "true"}, strict=True)
     for it in msg.get("photos", []):
         cap = caption(it)
-        if not (it.get("img") and tg("sendPhoto", {"photo": it["img"], "caption": cap})):
-            tg("sendMessage", {"text": cap})        # sem foto: manda só o texto
+        mk = buttons(it)
+        extra = {"reply_markup": mk} if mk else {}
+        sent = False
+        if it.get("img"):
+            sent = (tg("sendPhoto", {"photo": it["img"], "caption": cap, **extra})
+                    or tg("sendPhoto", {"photo": it["img"], "caption": cap}))
+        if not sent:                                    # sem foto: manda só o texto
+            tg("sendMessage", {"text": cap, "disable_web_page_preview": "true", **extra}) \
+                or tg("sendMessage", {"text": cap})
 
 
-def compare(name, title, home, items, cats, prev):
-    """Devolve (mensagens, primeira_vez)."""
+def notify_admin(text, dry):
+    """Avisos do próprio bot (falhas, resumo) vão para o destino masculino (o seu)."""
+    CUR_GENDER[0] = "M"
+    send({"text": text}, dry)
+
+
+def tg_call(token, method, params):
+    body = urllib.parse.urlencode(params).encode()
+    return json.load(urllib.request.urlopen(f"https://api.telegram.org/bot{token}/{method}",
+                                            body, timeout=30))
+
+
+def process_updates(state):
+    """Lê os toques nos botões (silenciar / reativar loja) desde a última volta."""
+    muted = state.setdefault("muted", [])
+    offs = state.setdefault("tg_offset", {})
+    seen = set()
+    for g in ("M", "F"):
+        CUR_GENDER[0] = g
+        token, _ = creds()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        tid = token.split(":")[0]
+        try:
+            r = tg_call(token, "getUpdates", {"offset": offs.get(tid, 0), "timeout": 0,
+                                              "allowed_updates": json.dumps(["callback_query"])})
+        except Exception as e:
+            print(f"  (getUpdates falhou: {type(e).__name__})")
+            continue
+        for u in r.get("result", []):
+            offs[tid] = u["update_id"] + 1
+            cq = u.get("callback_query") or {}
+            data, chat = cq.get("data", ""), dig(cq, "message", "chat", "id")
+            try:
+                if data.startswith("mute:"):
+                    k = data[5:]
+                    if k not in muted:
+                        muted.append(k)
+                    tg_call(token, "answerCallbackQuery", {"callback_query_id": cq["id"],
+                                                           "text": f"🔕 {k} silenciada"})
+                    tg_call(token, "sendMessage", {
+                        "chat_id": chat, "text": f"🔕 {k} silenciada. Para voltar a receber:",
+                        "reply_markup": json.dumps({"inline_keyboard": [[
+                            {"text": f"🔔 Reativar {k}", "callback_data": "unmute:" + k}]]})})
+                elif data.startswith("unmute:"):
+                    k = data[7:]
+                    if k in muted:
+                        muted.remove(k)
+                    tg_call(token, "answerCallbackQuery", {"callback_query_id": cq["id"],
+                                                           "text": f"🔔 {k} reativada"})
+                    tg_call(token, "sendMessage", {"chat_id": chat, "text": f"🔔 {k} reativada."})
+            except Exception as e:
+                print(f"  (botão falhou: {type(e).__name__})")
+
+
+# ---------------------------------------------------------------- filtros
+def load_config():
+    try:
+        return json.loads((ROOT / "config.json").read_text(encoding="utf8"))
+    except Exception:
+        return {}
+
+
+def get_filters(g):
+    flt = dict((CONFIG.get("filters") or {}).get("all") or {})
+    flt.update((CONFIG.get("filters") or {}).get(g) or {})
+    return flt
+
+
+def basic_ok(i, flt):
+    if i["pct"] < (flt.get("min_pct") or 0):
+        return False
+    if flt.get("max_price") and i["price"] > flt["max_price"] * 100:
+        return False
+    name = i["name"].lower()
+    inc = [w.lower() for w in flt.get("include") or []]
+    if inc and not any(w in name for w in inc):
+        return False
+    return not any(w.lower() in name for w in flt.get("exclude") or [])
+
+
+def size_ok(i, wanted):
+    ok = i.get("sizes")
+    if ok is None:                      # tamanho desconhecido: não esconde a peça
+        return True
+    have = {x.lower() for x in ok}
+    return any(w.lower() in have for w in wanted)
+
+
+def compare(name, title, home, items, cats, prev, hist, skey):
+    """Devolve (mensagens, primeira_vez). `hist` guarda o menor preço já visto de cada peça."""
     first = prev is None
     prev = prev or {}
     old_items = prev.get("items", {})
     old_cats = {str(c["id"]) for c in prev.get("categories", [])}
+    for k, i in items.items():
+        i["k"], i["skey"] = k, skey
     msgs = []
-    if first:
-        return msgs, True
-    tag = f"🏬 {name.upper()} · {title[len(name) + 1:].upper()}"     # loja em destaque
-    new_cats = [c for c in cats if str(c["id"]) not in old_cats]
-    if new_cats:
-        msgs.append(f"{tag}\n🚨 Abriu área de promoção: "
-                    f"{', '.join(c['name'] for c in new_cats)}\n{home}")
-    if len(items) >= MASS_SALE_MIN and len(old_items) < MASS_SALE_MIN:
-        msgs.append(f"{tag}\n🔥 SALE GERAL: {len(items)} peças com desconto agora!\n{home}")
-    novos = sorted((i for k, i in items.items() if k not in old_items), key=lambda i: -i["pct"])
-    subiu = [i for k, i in items.items()
-             if k in old_items and i["pct"] - old_items[k]["pct"] >= MIN_JUMP_PTS]
-    if novos or subiu:
-        msg = f"{tag}\n🛍️ {len(novos)} peça(s) nova(s) em sale"
-        if subiu:
-            msg += f", {len(subiu)} com desconto maior"
-        shown = (novos + subiu)[:MAX_LINES]
-        for i in shown:
-            i["store"] = tag
-        fill_sizes(name, shown)
-        photos = [i for i in shown if i.get("img")][:MAX_PHOTOS]
-        sem_foto = [i for i in shown if i not in photos]
-        if sem_foto:
-            msg += "\n\n" + "\n".join(fmt(i) for i in sem_foto)
-        extra = len(novos) + len(subiu) - len(shown)
-        if extra > 0:
-            msg += f"\n… e mais {extra}"
-        msgs.append({"text": msg, "photos": photos})
-    return msgs, False
+    if not first:
+        tag = f"🏬 {name.upper()} · {title[len(name) + 1:].upper()}"     # loja em destaque
+        new_cats = [c for c in cats if str(c["id"]) not in old_cats]
+        if new_cats:
+            msgs.append(f"{tag}\n🚨 Abriu área de promoção: "
+                        f"{', '.join(c['name'] for c in new_cats)}\n{home}")
+        if len(items) >= MASS_SALE_MIN and len(old_items) < MASS_SALE_MIN:
+            msgs.append(f"{tag}\n🔥 SALE GERAL: {len(items)} peças com desconto agora!\n{home}")
+        novos = sorted((i for k, i in items.items() if k not in old_items), key=lambda i: -i["pct"])
+        subiu = [i for k, i in items.items()
+                 if k in old_items and i["pct"] - old_items[k]["pct"] >= MIN_JUMP_PTS]
+        flt = get_filters(CUR_GENDER[0])
+        cand = [i for i in novos + subiu if basic_ok(i, flt)]
+        wanted = flt.get("sizes") or []
+        if wanted:                                     # filtro de tamanho: consulta o estoque antes
+            cand = cand[:FILTER_CAP]
+            fill_sizes(name, cand)
+            cand = [i for i in cand if size_ok(i, wanted)]
+        if cand:
+            for i in cand:
+                i["prev_min"], i["store"] = hist.get(i["k"]), tag
+            n_new = sum(1 for i in cand if i["k"] not in old_items)
+            msg = f"{tag}\n🛍️ {n_new} peça(s) nova(s) em sale"
+            if len(cand) - n_new:
+                msg += f", {len(cand) - n_new} com desconto maior"
+            shown = cand[:MAX_LINES]
+            fill_sizes(name, shown)
+            photos = [i for i in shown if i.get("img")][:MAX_PHOTOS]
+            sem_foto = [i for i in shown if i not in photos]
+            if sem_foto:
+                msg += "\n\n" + "\n".join(fmt(i) for i in sem_foto)
+            if len(cand) > len(shown):
+                msg += f"\n… e mais {len(cand) - len(shown)}"
+            NOVOS_COUNT[0] += len(cand)
+            msgs.append({"text": msg, "photos": photos})
+    for k, i in items.items():                         # atualiza o menor preço visto
+        old = hist.get(k)
+        hist[k] = min(old, i["price"]) if old else i["price"]
+    return msgs, first
 
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     dry = "--dry" in sys.argv
+
     def arg(flag):
         return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else None
 
@@ -749,13 +887,21 @@ def main():
     stores_only = {x.strip().lower() for x in (arg("--stores") or "").split(",") if x.strip()}
     stores_skip = {x.strip().lower() for x in (arg("--skip") or "").split(",") if x.strip()}
     state_path = Path(arg("--state")) if arg("--state") else STATE
+    full_run = not (only or stores_only)
     load_env()
+    CONFIG.update(load_config())
     state = json.loads(state_path.read_text(encoding="utf8")) if state_path.exists() else {}
     if "items" in state:                                   # formato antigo (só Zara)
         state = {"stores": {"Zara": state}}
     stores = state.setdefault("stores", {})
     HM_CACHE.update(state.get("hm_checked", {}))
+    hist_all = state.setdefault("hist", {})
+    health = state.setdefault("health", {})
+    if not dry:
+        process_updates(state)                             # toques em "silenciar/reativar"
+    muted = set(state.get("muted", []))
     status = {}                                            # resumo por loja (visível no state.json)
+    n_ok = n_err = 0
 
     for (name, g), fn in STORES.items():
         if only and only not in name.lower():
@@ -771,12 +917,28 @@ def main():
             items, cats, home = fn()
             print(f"  ({title}: coletado em {time.time() - t0:.0f}s)", flush=True)
         except Exception as e:                              # uma loja caída não derruba as outras
-            print(f"[{title}] ERRO: {type(e).__name__}: {str(e)[:120]}")
-            status[title] = f"ERRO {type(e).__name__}: {str(e)[:60]}"
+            err = f"{type(e).__name__}: {str(e)[:100]}"
+            print(f"[{title}] ERRO: {err}")
+            status[title] = f"ERRO {err[:70]}"
             if os.environ.get("RADAR_DEBUG"):
                 traceback.print_exc()
+            h = health.setdefault(title, {"fails": 0, "alerted": False})
+            h["fails"] += 1
+            if h["fails"] == 3 and not h["alerted"]:       # 3 voltas seguidas com erro
+                notify_admin(f"⚠️ {title}: erro há 3 voltas seguidas.\n{err}", dry)
+                h["alerted"] = True
+            n_err += 1
             continue
-        msgs, first = compare(name, title, home, items, cats, stores.get(key))
+        h = health.get(title)
+        if h and h.get("fails"):
+            if h.get("alerted"):
+                notify_admin(f"✅ {title} voltou a funcionar.", dry)
+            health[title] = {"fails": 0, "alerted": False}
+        n_ok += 1
+        msgs, first = compare(name, title, home, items, cats, stores.get(key),
+                              hist_all.setdefault(key, {}), key)
+        if key in muted:
+            msgs = []                                       # loja silenciada pelo botão
         for m in msgs:
             send(m, dry)
         areas = [c["name"] for c in cats] or "nenhuma"
@@ -789,6 +951,28 @@ def main():
 
     state["hm_checked"] = HM_CACHE
     state["status"] = {**state.get("status", {}), **status}
+
+    # resumo diário (uma vez por dia, depois das 9h de Brasília, só em volta completa)
+    now = datetime.now(BRT)
+    today = now.strftime("%Y-%m-%d")
+    daily = state.setdefault("daily", {"novos": 0, "sent": ""})
+    daily["novos"] += NOVOS_COUNT[0]
+    if full_run and not dry and now.hour >= 9 and daily.get("sent") != today:
+        totals = {"Homem": 0, "Mulher": 0}
+        for t, v in state["status"].items():
+            for gname in totals:
+                if t.endswith(gname) and isinstance(v, int):
+                    totals[gname] += v
+        erros = [t for t, v in state["status"].items() if isinstance(v, str)]
+        txt = (f"📊 Resumo {today}: {n_ok} lojas ok, {n_err} com erro nesta volta.\n"
+               f"Peças novas avisadas desde o último resumo: {daily['novos']}.\n"
+               f"Em sale agora: Homem {totals['Homem']} · Mulher {totals['Mulher']}.")
+        if erros:
+            txt += "\n⚠️ Com erro: " + ", ".join(erros)
+        if state.get("muted"):
+            txt += "\n🔕 Silenciadas: " + ", ".join(state["muted"])
+        notify_admin(txt, dry)
+        daily["sent"], daily["novos"] = today, 0
     if not dry:
         state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf8")
 

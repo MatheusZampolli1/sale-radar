@@ -1,0 +1,8 @@
+{
+  "_ajuda": "Filtros dos alertas. 'all' vale para os dois; 'M' (homem) e 'F' (mulher) sobrescrevem. Campos: min_pct (desconto mínimo %), max_price (preço máximo em reais), sizes (só avisa se tiver algum destes tamanhos, ex: [\"M\",\"G\"]), include / exclude (palavras no nome). Vazio = sem filtro.",
+  "filters": {
+    "all": {"min_pct": 0, "max_price": null, "sizes": [], "include": [], "exclude": []},
+    "M": {},
+    "F": {}
+  }
+}
