@@ -467,7 +467,7 @@ def magazord(base, g):
     """Página /sale da loja; os produtos vêm em JSON dentro do HTML (itens: [...])."""
     items = {}
     for page in range(1, 21):
-        html = get_text(f"{base}/sale?p={page}")
+        html = get_text(f"{base}/sale?p={page}", RIA_HDR)
         i = html.find("itens: ")
         if i < 0:
             break
@@ -504,8 +504,10 @@ def dust(g):
         seen = set()
         for page in range(1, 31):
             try:
-                html = get_text(f"{DUST}/categoria/{cat}/?page={page}")
+                html = get_text(f"{DUST}/categoria/{cat}/?page={page}", RIA_HDR)
             except Exception:
+                if page == 1:
+                    raise                       # falha na 1ª página: erro visível, e não "0 peças"
                 break
             new = 0
             for c in DUST_CARD.split(html)[1:]:
@@ -531,7 +533,7 @@ def dust(g):
 
 
 def dust_sizes(item):
-    html = get_text(item["url"])
+    html = get_text(item["url"], RIA_HDR)
     ok, out = [], []
     for m in re.finditer(r'<input type="radio"([^>]*)data-variation-name="Tamanho"([^>]*)>\s*'
                          r'<label([^>]*)>\s*<span>\s*([^<]+?)\s*</span>', html):
