@@ -625,6 +625,7 @@ def main():
         state = {"stores": {"Zara": state}}
     stores = state.setdefault("stores", {})
     HM_CACHE.update(state.get("hm_checked", {}))
+    status = {}                                            # resumo por loja (visível no state.json)
 
     for (name, g), fn in STORES.items():
         if only and only not in name.lower():
@@ -635,6 +636,7 @@ def main():
             items, cats, home = fn()
         except Exception as e:                              # uma loja caída não derruba as outras
             print(f"[{title}] ERRO: {type(e).__name__}: {str(e)[:120]}")
+            status[title] = f"ERRO {type(e).__name__}: {str(e)[:60]}"
             if os.environ.get("RADAR_DEBUG"):
                 traceback.print_exc()
             continue
@@ -647,8 +649,10 @@ def main():
         elif not msgs:
             print(f"[{title}] sem novidades ({len(items)} em sale)")
         stores[key] = {"items": items, "categories": cats}
+        status[title] = len(items)
 
     state["hm_checked"] = HM_CACHE
+    state["status"] = {**state.get("status", {}), **status}
     if not dry:
         STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf8")
 
