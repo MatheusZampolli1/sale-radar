@@ -57,9 +57,16 @@ def is_sale_label(text):
     return any(w in t for w in SALE_WORDS) or bool(OFF_WORD.search(t))
 
 
-def make_item(name, price, old, url, img=None):
-    return {"name": name.title(), "price": price, "old": old,
+def make_item(name, price, old, url, img=None, **extra):
+    item = {"name": name.title(), "price": price, "old": old,
             "pct": round((1 - price / old) * 100), "url": url, "img": img}
+    item.update(extra)
+    return item
+
+
+def to_cents(v):
+    v = int(v)
+    return v // 1000 if v >= 1_000_000 else v
 
 
 def dig(obj, *path):
@@ -110,13 +117,15 @@ def zara():
                         seo = c.get("seo", {})
                         url = f"{ZARA}/{seo.get('keyword', 'x')}-p{seo.get('seoProductId', '')}.html"
                         img = dig(c, "detail", "colors", 0, "xmedia", 0, "extraInfo", "deliveryUrl")
-                        items[str(c["id"])] = make_item(c.get("name", "?"), price, old, url, img)
+                        items[str(c["id"])] = make_item(
+                            c.get("name", "?"), price, old, url, img,
+                            color=dig(c, "detail", "colors", 0, "id"))
     return items, cats, f"{ZARA}/"
 
 
 # ------------------------------------------------------------- Bershka
 BSK = "https://www.bershka.com/itxrest"
-BSK_STORE = "45109565/40259535"
+BSK_STORE = "44009529/40259551"      # loja BR (achada no HTML do site: iCountryCode BR)
 BSK_HDR = {"Referer": "https://www.bershka.com/br/h-man.html",
            "Origin": "https://www.bershka.com",
            # cabecalhos de navegador: sem eles o IP do GitHub toma 403
@@ -128,7 +137,7 @@ BSK_HDR = {"Referer": "https://www.bershka.com/br/h-man.html",
 
 
 def bershka():
-    tree = get_json(f"{BSK}/2/catalog/store/{BSK_STORE}/category?languageId=-300&appId=1", BSK_HDR)
+    tree = get_json(f"{BSK}/2/catalog/store/{BSK_STORE}/category?languageId=-63&appId=1", BSK_HDR)
     men = next(c for c in tree["categories"] if c.get("nameEn") == "MEN" or c.get("name") == "MEN")
     cats = []
 
@@ -142,17 +151,17 @@ def bershka():
     ids = []
     for c in cats:
         d = get_json(f"{BSK}/3/catalog/store/{BSK_STORE}/category/{c['id']}/product"
-                     f"?showProducts=false&languageId=-300&appId=1", BSK_HDR)
+                     f"?showProducts=false&languageId=-63&appId=1", BSK_HDR)
         ids += [i for i in d.get("productIds", []) if i not in ids]
     items = {}
     for i in range(0, len(ids), 20):
         chunk = ",".join(map(str, ids[i:i + 20]))
         d = get_json(f"{BSK}/3/catalog/store/{BSK_STORE}/productsArray?productIds={chunk}"
-                     f"&languageId=-300&appId=1", BSK_HDR)
+                     f"&languageId=-63&appId=1", BSK_HDR)
         for p in d.get("products", []):
             for s in p.get("bundleProductSummaries") or [p]:
                 for col in (s.get("detail") or {}).get("colors", []):
-                    prices = [(int(z["price"]) // 1000, int(z["oldPrice"]) // 1000)
+                    prices = [(to_cents(z["price"]), to_cents(z["oldPrice"]))
                               for z in col.get("sizes", []) if z.get("price") and z.get("oldPrice")]
                     if not prices:
                         continue
@@ -163,7 +172,12 @@ def bershka():
                             p.get("name") or col.get("name", "?"), price, old,
                             f"https://www.bershka.com/br/c0p{p['id']}.html",
                             dig(s, "detail", "xmedia", 0, "xmediaItems", 0, "medias", 0,
-                                "extraInfo", "deliveryUrl"))
+                                "extraInfo", "deliveryUrl"),
+                            pid=p["id"],
+                            skus={str(z["sku"]): z["name"] for z in col.get("sizes", [])
+                                  if z.get("isBuyable") and z.get("visibilityValue", "SHOW") == "SHOW"},
+                            hidden=[z["name"] for z in col.get("sizes", [])
+                                    if not (z.get("isBuyable") and z.get("visibilityValue", "SHOW") == "SHOW")])
     return items, cats, "https://www.bershka.com/br/h-man.html"
 
 
@@ -172,6 +186,16 @@ HM = "https://www.hm.com.br"
 HM_MEN = 2069073889
 HM_CACHE = {}   # productId -> {"k": [preco_api, preco_lista], "p": preco_publico_ou_None}
 HM_OFFER = re.compile(r'"offers":\{"availability":"[^"]*","itemCondition":"[^"]*","price":([0-9.]+)')
+
+
+def hm_sizes(p):
+    ok, out = [], []
+    for sk in p.get("items", []):
+        name = (sk.get("TAMANHO") or ["?"])[0]
+        offer = (sk.get("sellers") or [{}])[0].get("commertialOffer") or {}
+        (ok if offer.get("AvailableQuantity", 0) > 0 else out).append(name)
+    ok = list(dict.fromkeys(ok))
+    return {"sizes": ok, "sold_out": [n for n in dict.fromkeys(out) if n not in ok]}
 
 
 def hm_public_price(pid, link, api_price, old):
@@ -222,7 +246,8 @@ def hm():
                         if real:
                             items[pid] = make_item(
                                 p["productName"], round(real * 100), round(old * 100), p["link"],
-                                dig(it, "images", 0, "imageUrl"))
+                                dig(it, "images", 0, "imageUrl"),
+                                **hm_sizes(p))
             if len(page) < 50:
                 break
     return items, cats, f"{HM}/masculino"
@@ -237,7 +262,7 @@ def you_search(term):
     out, start, rows = [], 0, 100
     for _ in range(15):
         q = ('{ productSearch(query:"%s", start:%d, rows:%d){ data{ pagination{hasNextPage} '
-             'products{ name price oldPrice productId link images } } } }') % (term, start, rows)
+             'products{ name price oldPrice productId link images sku colors{ label } } } } }') % (term, start, rows)
         req = urllib.request.Request(
             YOU_API, data=json.dumps({"query": q}).encode(),
             headers={"User-Agent": UA, "Content-Type": "application/json",
@@ -265,11 +290,92 @@ def youcom():
                 link = (p.get("link") or "").split("?")[0]
                 items[p["productId"]] = make_item(
                     p["name"], round(price * 100), round(old * 100), YOU + link,
-                    (p.get("images") or [None])[0])
+                    (p.get("images") or [None])[0],
+                    color=((p.get("colors") or [{}])[0] or {}).get("label"))
     return items, [], YOU + "/promocao-roupas-masculinas"
 
 
 STORES = {"Zara": zara, "Bershka": bershka, "H&M": hm, "Youcom": youcom}
+
+
+def zara_sizes(item):
+    page = get_json(item["url"] + "?ajax=true", {
+        "Referer": ZARA + "/", "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin"})
+    colors = dig(page, "product", "detail", "colors") or []
+    col = next((c for c in colors if c.get("id") == item.get("color")), None)
+    if col is None:
+        return None
+    sizes = col.get("sizes", [])
+    return ([z["name"] for z in sizes if z.get("availability") != "out_of_stock"],
+            [z["name"] for z in sizes if z.get("availability") == "out_of_stock"])
+
+
+def bershka_sizes(item):
+    skus = item.get("skus") or {}
+    hidden = list(item.get("hidden") or [])
+    try:
+        st = get_json(f"{BSK}/2/catalog/store/{BSK_STORE}/product/{item['pid']}/stock"
+                      f"?languageId=-63", BSK_HDR)
+    except Exception:
+        return list(skus.values()), hidden      # sem consulta de estoque: usa a lista visivel
+    avail = {str(z["id"]): z.get("availability")
+             for p in st.get("stocks", []) for z in p.get("stocks", [])}
+    ok = [n for k, n in skus.items() if avail.get(k, "in_stock") != "out_of_stock"]
+    out = [n for k, n in skus.items() if avail.get(k, "in_stock") == "out_of_stock"]
+    return ok, out + hidden
+
+
+def youcom_sizes(item):
+    pid = item["url"].rsplit("-p", 1)[-1].split("?")[0]
+    q = ('{ productDetails(id:"%s"){ colorVariations{ color{ name } '
+         'sizeVariations{ name available } } } }' % pid)
+    req = urllib.request.Request(
+        YOU_API, data=json.dumps({"query": q}).encode(),
+        headers={"User-Agent": UA, "Content-Type": "application/json",
+                 "Accept": "application/json", "Accept-Encoding": "gzip",
+                 "Origin": YOU, "Referer": YOU + "/"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = r.read()
+        if r.headers.get("Content-Encoding") == "gzip":
+            data = gzip.decompress(data)
+    cols = json.loads(data.decode("utf8"))["data"]["productDetails"]["colorVariations"]
+    want = str(item.get("color") or "").lower()
+    col = next((c for c in cols if str((c.get("color") or {}).get("name", "")).lower() == want), None)
+    if col is None:
+        return None
+    sizes = col["sizeVariations"]
+    return ([z["name"] for z in sizes if z.get("available")],
+            [z["name"] for z in sizes if not z.get("available")])
+
+
+SIZE_FETCHERS = {"Zara": zara_sizes, "Bershka": bershka_sizes, "Youcom": youcom_sizes}
+
+
+def fill_sizes(store, items):
+    """Zara, Bershka e Youcom: consulta o estoque real so das pecas que vao no alerta."""
+    fetch = SIZE_FETCHERS.get(store)
+    for it in items:
+        if fetch:
+            it["sizes"], it["sold_out"] = None, None     # nunca reaproveita tamanho velho
+            try:
+                res = fetch(it)
+                if res is not None:
+                    it["sizes"], it["sold_out"] = res
+            except Exception as e:
+                print(f"  (tamanhos {store} indisponíveis: {type(e).__name__})")
+
+
+def sizes_line(item):
+    """Padrao unico em todas as lojas."""
+    ok = item.get("sizes")
+    if ok is None:
+        return ""
+    text = "📏 TAMANHOS: " + " · ".join(ok) if ok else "📏 Sem tamanho disponível agora"
+    out = item.get("sold_out") or []
+    if out:
+        text += "\n🚫 Esgotado: " + " · ".join(out)
+    return text
 
 
 # --------------------------------------------------------- notificação
@@ -278,13 +384,17 @@ def brl(cents):
 
 
 def fmt(item):
+    line = sizes_line(item)
     return (f"• {item['name']} — {brl(item['price'])} "
-            f"(de {brl(item['old'])}, -{item['pct']}%)\n  {item['url']}")
+            f"(de {brl(item['old'])}, -{item['pct']}%)\n"
+            + (f"  {line.replace(chr(10), chr(10) + '  ')}\n" if line else "") + f"  {item['url']}")
 
 
 def caption(item):
+    line = sizes_line(item)
     return (f"{item['name']}\n{brl(item['price'])} "
-            f"(de {brl(item['old'])}, -{item['pct']}%)\n{item['url']}")
+            f"(de {brl(item['old'])}, -{item['pct']}%)\n"
+            + (f"{line}\n" if line else "") + item["url"])
 
 
 def tg(method, params, strict=False):
@@ -341,6 +451,7 @@ def compare(store, home, items, cats, prev):
         if subiu:
             msg += f", {len(subiu)} com desconto maior"
         shown = (novos + subiu)[:MAX_LINES]
+        fill_sizes(store, shown)
         photos = [i for i in shown if i.get("img")][:MAX_PHOTOS]
         sem_foto = [i for i in shown if i not in photos]
         if sem_foto:
