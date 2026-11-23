@@ -26,6 +26,7 @@ OFF_WORD = re.compile(r"\bOFF\b")  # so palavra inteira (evita HOME OFFICE)
 MASS_SALE_MIN = 150     # nº de peças em sale que conta como "sale geral"
 MIN_JUMP_PTS = 5        # desconto precisa subir X pontos para avisar
 MAX_LINES = 12
+MAX_PHOTOS = 8
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
@@ -56,9 +57,30 @@ def is_sale_label(text):
     return any(w in t for w in SALE_WORDS) or bool(OFF_WORD.search(t))
 
 
-def make_item(name, price, old, url):
+def make_item(name, price, old, url, img=None):
     return {"name": name.title(), "price": price, "old": old,
-            "pct": round((1 - price / old) * 100), "url": url}
+            "pct": round((1 - price / old) * 100), "url": url, "img": img}
+
+
+def dig(obj, *path):
+    """Acessa obj[a][b][c]... sem quebrar se faltar algo."""
+    for k in path:
+        try:
+            obj = obj[k]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return obj
+
+
+def get_text(url):
+    headers = {"User-Agent": UA, "Accept": "text/html,*/*",
+               "Accept-Language": "pt-BR,pt;q=0.9", "Accept-Encoding": "gzip",
+               "Connection": "close"}
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=40) as r:
+        data = r.read()
+        if r.headers.get("Content-Encoding") == "gzip":
+            data = gzip.decompress(data)
+    return data.decode("utf8", "replace")
 
 
 # ---------------------------------------------------------------- Zara
@@ -87,7 +109,8 @@ def zara():
                     if c.get("id") and price and old and old > price:
                         seo = c.get("seo", {})
                         url = f"{ZARA}/{seo.get('keyword', 'x')}-p{seo.get('seoProductId', '')}.html"
-                        items[str(c["id"])] = make_item(c.get("name", "?"), price, old, url)
+                        img = dig(c, "detail", "colors", 0, "xmedia", 0, "extraInfo", "deliveryUrl")
+                        items[str(c["id"])] = make_item(c.get("name", "?"), price, old, url, img)
     return items, cats, f"{ZARA}/"
 
 
@@ -138,13 +161,35 @@ def bershka():
                         url = f"https://www.bershka.com/br/{p.get('name', 'x')}-c0p{p['id']}.html"
                         items[f"{p['id']}-{col.get('id')}"] = make_item(
                             p.get("name") or col.get("name", "?"), price, old,
-                            f"https://www.bershka.com/br/c0p{p['id']}.html")
+                            f"https://www.bershka.com/br/c0p{p['id']}.html",
+                            dig(s, "detail", "xmedia", 0, "xmediaItems", 0, "medias", 0,
+                                "extraInfo", "deliveryUrl"))
     return items, cats, "https://www.bershka.com/br/h-man.html"
 
 
 # ----------------------------------------------------------------- H&M
 HM = "https://www.hm.com.br"
 HM_MEN = 2069073889
+HM_CACHE = {}   # productId -> {"k": [preco_api, preco_lista], "p": preco_publico_ou_None}
+HM_OFFER = re.compile(r'"offers":\{"availability":"[^"]*","itemCondition":"[^"]*","price":([0-9.]+)')
+
+
+def hm_public_price(pid, link, api_price, old):
+    """A API da H&M devolve o preco de MEMBRO. Sale de verdade = preco da pagina publica < preco de lista."""
+    key = [api_price, old]
+    c = HM_CACHE.get(pid)
+    if c and c["k"] == key:
+        return c["p"]
+    try:
+        m = HM_OFFER.search(get_text(link))
+    except Exception:
+        return None                      # nao conseguiu verificar: tenta de novo na proxima rodada
+    if not m:
+        return None
+    pub = float(m.group(1))
+    res = pub if pub < old - 0.005 else None
+    HM_CACHE[pid] = {"k": key, "p": res}
+    return res
 
 
 def hm():
@@ -172,8 +217,12 @@ def hm():
                     o = (it.get("sellers") or [{}])[0].get("commertialOffer", {})
                     price, old = o.get("Price"), o.get("ListPrice")
                     if price and old and old > price:
-                        items[str(p["productId"])] = make_item(
-                            p["productName"], round(price * 100), round(old * 100), p["link"])
+                        pid = str(p["productId"])
+                        real = hm_public_price(pid, p["link"], price, old)
+                        if real:
+                            items[pid] = make_item(
+                                p["productName"], round(real * 100), round(old * 100), p["link"],
+                                dig(it, "images", 0, "imageUrl"))
             if len(page) < 50:
                 break
     return items, cats, f"{HM}/masculino"
@@ -188,7 +237,7 @@ def you_search(term):
     out, start, rows = [], 0, 100
     for _ in range(15):
         q = ('{ productSearch(query:"%s", start:%d, rows:%d){ data{ pagination{hasNextPage} '
-             'products{ name price oldPrice productId link } } } }') % (term, start, rows)
+             'products{ name price oldPrice productId link images } } } }') % (term, start, rows)
         req = urllib.request.Request(
             YOU_API, data=json.dumps({"query": q}).encode(),
             headers={"User-Agent": UA, "Content-Type": "application/json",
@@ -215,7 +264,8 @@ def youcom():
             if price and old and old > price:
                 link = (p.get("link") or "").split("?")[0]
                 items[p["productId"]] = make_item(
-                    p["name"], round(price * 100), round(old * 100), YOU + link)
+                    p["name"], round(price * 100), round(old * 100), YOU + link,
+                    (p.get("images") or [None])[0])
     return items, [], YOU + "/promocao-roupas-masculinas"
 
 
@@ -232,16 +282,40 @@ def fmt(item):
             f"(de {brl(item['old'])}, -{item['pct']}%)\n  {item['url']}")
 
 
-def send(text, dry):
-    print(text, "\n" + "-" * 40)
+def caption(item):
+    return (f"{item['name']}\n{brl(item['price'])} "
+            f"(de {brl(item['old'])}, -{item['pct']}%)\n{item['url']}")
+
+
+def tg(method, params, strict=False):
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    body = urllib.parse.urlencode({"chat_id": chat, **params}).encode()
+    try:
+        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/{method}", body, timeout=30)
+        return True
+    except Exception as e:
+        if strict:
+            raise
+        print(f"  (telegram {method} falhou: {type(e).__name__})")
+        return False
+
+
+def send(msg, dry):
+    if isinstance(msg, str):
+        msg = {"text": msg}
+    print(msg["text"], "\n" + "-" * 40)
+    for it in msg.get("photos", []):
+        print("  [foto]", it["name"], it.get("img"))
     token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if dry or not token or not chat:
         if not dry:
             print("(sem TELEGRAM_BOT_TOKEN/CHAT_ID: mensagem não enviada)")
         return
-    body = urllib.parse.urlencode({"chat_id": chat, "text": text,
-                                   "disable_web_page_preview": "true"}).encode()
-    urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", body, timeout=30)
+    tg("sendMessage", {"text": msg["text"], "disable_web_page_preview": "true"}, strict=True)
+    for it in msg.get("photos", []):
+        cap = caption(it)
+        if not (it.get("img") and tg("sendPhoto", {"photo": it["img"], "caption": cap})):
+            tg("sendMessage", {"text": cap})        # sem foto: manda so o texto
 
 
 def compare(store, home, items, cats, prev):
@@ -266,11 +340,15 @@ def compare(store, home, items, cats, prev):
         msg = f"🛍️ {store} Homem: {len(novos)} peça(s) nova(s) em sale"
         if subiu:
             msg += f", {len(subiu)} com desconto maior"
-        msg += "\n\n" + "\n".join(fmt(i) for i in (novos + subiu)[:MAX_LINES])
-        extra = len(novos) + len(subiu) - MAX_LINES
+        shown = (novos + subiu)[:MAX_LINES]
+        photos = [i for i in shown if i.get("img")][:MAX_PHOTOS]
+        sem_foto = [i for i in shown if i not in photos]
+        if sem_foto:
+            msg += "\n\n" + "\n".join(fmt(i) for i in sem_foto)
+        extra = len(novos) + len(subiu) - len(shown)
         if extra > 0:
             msg += f"\n… e mais {extra}"
-        msgs.append(msg)
+        msgs.append({"text": msg, "photos": photos})
     return msgs, False
 
 
@@ -282,6 +360,7 @@ def main():
     if "items" in state:                                   # formato antigo (só Zara)
         state = {"stores": {"Zara": state}}
     stores = state.setdefault("stores", {})
+    HM_CACHE.update(state.get("hm_checked", {}))
 
     for name, fn in STORES.items():
         try:
@@ -301,6 +380,7 @@ def main():
             print(f"[{name}] sem novidades ({len(items)} em sale)")
         stores[name] = {"items": items, "categories": cats}
 
+    state["hm_checked"] = HM_CACHE
     if not dry:
         STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf8")
 
