@@ -173,7 +173,47 @@ def hm():
     return items, cats, f"{HM}/masculino"
 
 
-STORES = {"Zara": zara, "Bershka": bershka, "H&M": hm}
+# -------------------------------------------------------------- Youcom
+YOU = "https://www.youcom.com.br"
+YOU_API = "https://apisite.youcom.com.br/graphql"
+
+
+def you_search(term):
+    out, start, rows = [], 0, 100
+    for _ in range(15):
+        q = ('{ productSearch(query:"%s", start:%d, rows:%d){ data{ pagination{hasNextPage} '
+             'products{ name price oldPrice productId link } } } }') % (term, start, rows)
+        req = urllib.request.Request(
+            YOU_API, data=json.dumps({"query": q}).encode(),
+            headers={"User-Agent": UA, "Content-Type": "application/json",
+                     "Accept": "application/json", "Accept-Encoding": "gzip",
+                     "Origin": YOU, "Referer": YOU + "/"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                data = gzip.decompress(data)
+        d = json.loads(data.decode("utf8"))["data"]["productSearch"]["data"]
+        out += d["products"]
+        start += rows
+        if not d["pagination"]["hasNextPage"]:
+            break
+    return out
+
+
+def youcom():
+    items = {}
+    # pagina oficial de promocao masculina + busca geral "masculino"
+    for term in ("promocao-roupas-masculinas", "masculino"):
+        for p in you_search(term):
+            price, old = p.get("price"), p.get("oldPrice")
+            if price and old and old > price:
+                link = (p.get("link") or "").split("?")[0]
+                items[p["productId"]] = make_item(
+                    p["name"], round(price * 100), round(old * 100), YOU + link)
+    return items, [], YOU + "/promocao-roupas-masculinas"
+
+
+STORES = {"Zara": zara, "Bershka": bershka, "H&M": hm, "Youcom": youcom}
 
 
 # --------------------------------------------------------- notificação
