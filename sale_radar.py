@@ -98,14 +98,22 @@ ZARA = "https://www.zara.com/br/pt"
 ZARA_ROOT = {"M": "W2025-HOMBRE", "F": "W2025-MUJER"}
 
 
-def zara_view_all(c):
-    for s in c.get("subcategories", []):
-        if (s.get("key") or "").endswith("VIEW_ALL_PRODUCTS"):
-            return s["id"]
-        found = zara_view_all(s)
-        if found:
-            return found
-    return None
+def zara_view_all(root):
+    """Categorias 'ver tudo'. Masculino tem uma só (VIEW_ALL_PRODUCTS); feminino tem uma por tipo (VER_TODO)."""
+    found = []
+
+    def walk(c):
+        for s in c.get("subcategories", []):
+            k = (s.get("key") or "").upper()
+            if k.endswith("VIEW_ALL_PRODUCTS"):
+                found.append(("A", s["id"]))
+            elif k.endswith("VER_TODO") and not any(w in k for w in ("PERFUMES", "ZARA_HOME")):
+                found.append(("B", s["id"]))
+            walk(s)
+
+    walk(root)
+    single = [i for t, i in found if t == "A"]
+    return single[:1] or [i for t, i in found if t == "B"]
 
 
 def zara(g):
@@ -122,7 +130,7 @@ def zara(g):
     walk(root)
     view_all = zara_view_all(root)
     items = {}
-    for cid in dict.fromkeys([view_all] + [c["id"] for c in cats]):
+    for cid in dict.fromkeys(view_all + [c["id"] for c in cats]):
         data = get_json(f"{ZARA}/category/{cid}/products?ajax=true")
         for grp in data.get("productGroups", []):
             for e in grp.get("elements", []):
