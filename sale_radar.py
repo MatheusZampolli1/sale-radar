@@ -22,7 +22,7 @@ ROOT = Path(__file__).parent
 STATE = ROOT / "state.json"
 SALE_WORDS = ("SALE", "REBAJA", "PROMO", "OFERTA", "DESCONTO", "OUTLET",
               "SPECIAL PRICE", "PREÇOS ESPECIAIS", "LIQUIDA")
-OFF_WORD = re.compile(r"OFF")  # so palavra inteira (evita HOME OFFICE)
+OFF_WORD = re.compile(r"\bOFF\b")  # so palavra inteira (evita HOME OFFICE)
 MASS_SALE_MIN = 150     # nº de peças em sale que conta como "sale geral"
 MIN_JUMP_PTS = 5        # desconto precisa subir X pontos para avisar
 MAX_LINES = 12
