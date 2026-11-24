@@ -466,17 +466,25 @@ def renner(g):
                 continue
             if not old > price or round((1 - price / old) * 100) < RENNER_MIN_PCT:
                 continue
+            key = a["record.aggregationKey"][0]            # ex.: 927427157-COR927427157-17-1463TCX
+            pid, _, color_id = key.partition("-")
+            skus = {}
             try:
                 gv = json.loads(a["prop.product.groupView"][0])
-                sizes = [z["name"] for z in gv.get("groupTwo", [])]
+                two = gv.get("groupTwo", [])
+                names = {z["id"]: z["name"] for z in two}
+                prio = {z["id"]: z.get("priority", 0) for z in two}
+                col = (next((c for c in gv.get("groupOne", []) if c.get("id") == color_id), None)
+                       or (gv.get("groupOne") or [{}])[0])
+                for r in sorted(col.get("refs", []), key=lambda r: prio.get(r["id"], 0)):
+                    skus[str(r["skuId"])] = names.get(r["id"], r["id"])
             except (KeyError, IndexError, ValueError):
-                sizes = None
-            key = a["record.aggregationKey"][0]
+                pass
             img = (a.get("prop.product.largeImageUrl") or [None])[0]
             items[key] = make_item(
                 a["prop.product.displayName"][0], round(price * 100), round(old * 100),
                 RENNER + a["prop.product.url"][0], norm_img(img),
-                sizes=sizes, sold_out=[], sizes_unverified=True)
+                pid=pid, skus=skus)
     return items, [], f"{RENNER}/c/" + ("feminino" if g == "F" else "masculino")
 
 
@@ -645,14 +653,36 @@ def youcom_sizes(item):
             [z["name"] for z in sizes if not z.get("available")])
 
 
+def renner_sizes(item):
+    """Estoque real por tamanho (a mesma consulta que o site faz ao abrir a peça)."""
+    skus = item.get("skus") or {}
+    if not skus:
+        return None
+    d = get_json(f"{RENNER}/bff/recommendations/sku-inventory?productId={item['pid']}"
+                 f"&skuList={','.join(skus)}",
+                 {"Referer": item["url"], "X-Requested-With": "XMLHttpRequest"})
+    if not d:
+        return None
+    by = {str(x.get("skuId")): x for x in d}
+    ok, out = [], []
+    for sku, name in skus.items():
+        x = by.get(sku)
+        if x is None:
+            continue
+        good = x.get("purchasable") and not x.get("discountinued") and not x.get("outOfStock")
+        (ok if good else out).append(name)
+    return ok, out
+
+
 SIZE_FETCHERS = {"Zara": zara_sizes, "Bershka": bershka_sizes, "Youcom": youcom_sizes,
-                 "The Dust Company": dust_sizes}
+                 "The Dust Company": dust_sizes, "Renner": renner_sizes}
 
 
 FILLED = set()          # peças cujo tamanho já foi consultado nesta volta
 NOVOS_COUNT = [0]       # peças avisadas (para o resumo diário)
 CONFIG = {}             # config.json (filtros pessoais)
 BRT = timezone(timedelta(hours=-3))
+FILL_BUDGET = 120       # consultas de estoque por loja a cada volta
 FILTER_CAP = 60         # máximo de peças consultadas por loja quando há filtro de tamanho
 
 
@@ -1234,28 +1264,32 @@ def compare(name, title, home, items, cats, prev, hist, skey):
         flt = get_filters(CUR_GENDER[0])
         cand = [i for i in novos + subiu if basic_ok(i, flt)]
         wanted = flt.get("sizes") or []
-        if wanted:                                     # filtro de tamanho: consulta o estoque antes
-            cand = cand[:FILTER_CAP]
-            fill_sizes(name, cand)
-            cand = [i for i in cand if size_ok(i, wanted)]
-        if cand:
-            for i in cand:
+        shown, rest, fills = [], [], 0
+        for idx, i in enumerate(cand):
+            if len(shown) >= MAX_LINES or fills >= FILL_BUDGET:
+                rest = cand[idx:]
+                break
+            if id(i) not in FILLED:
+                fills += 1
+            fill_sizes(name, [i])                          # estoque real por tamanho
+            if i.get("sizes") == [] and not i.get("sizes_unverified"):
+                deferred.add(i["k"])                       # nenhum tamanho disponível: não avisa; reavalia depois
+                continue
+            if wanted and not size_ok(i, wanted):
+                continue
+            shown.append(i)
+        deferred.update(i["k"] for i in rest)
+        if shown:
+            for i in shown:
                 i["prev_min"], i["store"] = hist.get(i["k"]), tag
-            n_new = sum(1 for i in cand if i["k"] not in old_items)
+            n_new = sum(1 for i in shown if i["k"] not in old_items)
             msg = f"{tag}\n🛍️ {n_new} peça(s) nova(s) em sale"
-            if len(cand) - n_new:
-                msg += f", {len(cand) - n_new} com desconto maior"
-            shown = cand[:MAX_LINES]
-            fill_sizes(name, shown)
-            photos = shown[:MAX_PHOTOS]
-            sem_foto = shown[MAX_PHOTOS:]
-            if sem_foto:
-                msg += "\n\n" + "\n".join(fmt(i) for i in sem_foto)
-            if len(cand) > len(shown):
-                msg += f"\n⏳ Mais {len(cand) - len(shown)} peça(s) saem nas próximas voltas."
-                deferred.update(i["k"] for i in cand[len(shown):])
-            NOVOS_COUNT[0] += len(cand)
-            msgs.append({"text": msg, "photos": photos})
+            if len(shown) - n_new:
+                msg += f", {len(shown) - n_new} com desconto maior"
+            if rest:
+                msg += f"\n⏳ Mais {len(rest)} peça(s) saem nas próximas voltas."
+            NOVOS_COUNT[0] += len(shown)
+            msgs.append({"text": msg, "photos": shown})
     for k, i in items.items():                         # atualiza o menor preço visto
         old = hist.get(k)
         hist[k] = min(old, i["price"]) if old else i["price"]
