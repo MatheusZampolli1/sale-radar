@@ -1193,6 +1193,23 @@ def size_ok(i, wanted):
     return any(w.lower() in have for w in wanted)
 
 
+REMEMBER_SECS = 3 * 24 * 3600     # peça que some da lista continua "lembrada" por 3 dias
+
+
+def remember(prev_items, items, deferred, now_ts):
+    """Estado a gravar: peças atuais (menos as adiadas) + peças que sumiram da lista há menos de 3 dias.
+    Evita avisar de novo uma peça que só saiu e voltou do ranking (Renner/Riachuelo veem só o topo)."""
+    for v in items.values():
+        v["ls"] = now_ts                                   # visto agora
+    keep = {k: v for k, v in items.items() if k not in deferred}
+    keep.update({k: prev_items[k] for k in deferred if k in prev_items})
+    for k, v in prev_items.items():
+        if k not in items and k not in keep:
+            if now_ts - v.setdefault("ls", now_ts) < REMEMBER_SECS:
+                keep[k] = v
+    return keep
+
+
 def compare(name, title, home, items, cats, prev, hist, skey):
     """Devolve (mensagens, primeira_vez). `hist` guarda o menor preço já visto de cada peça."""
     first = prev is None
@@ -1332,8 +1349,7 @@ def main():
             print(f"[{title}] 1ª execução: {len(items)} peças em sale memorizadas. Áreas: {areas}")
         elif not msgs:
             print(f"[{title}] sem novidades ({len(items)} em sale)")
-        keep = {k: v for k, v in items.items() if k not in deferred}      # adiadas: não marca como vistas
-        keep.update({k: prev_items[k] for k in deferred if k in prev_items})
+        keep = remember(prev_items, items, deferred, int(time.time()))    # adiadas ficam de fora; sumidas, lembradas
         stores[key] = {"items": keep, "categories": cats}
         status[title] = len(items)
 
