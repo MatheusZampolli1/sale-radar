@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -52,10 +53,18 @@ def get_json(url, extra=None):
                "Accept-Language": "pt-BR,pt;q=0.9", "Accept-Encoding": "gzip",
                "Connection": "close"}
     headers.update(extra or {})
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
-        data = r.read()
-        if r.headers.get("Content-Encoding") == "gzip":
-            data = gzip.decompress(data)
+    for attempt in (1, 2, 3):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
+                data = r.read()
+                if r.headers.get("Content-Encoding") == "gzip":
+                    data = gzip.decompress(data)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429, 502, 503) and attempt < 3:     # bloqueio momentâneo: espera e tenta de novo
+                time.sleep(3 * attempt)
+                continue
+            raise
     return json.loads(data.decode("utf8"))
 
 
@@ -1273,14 +1282,17 @@ def main():
             continue
         selected.append((name, g, fn))
 
-    def timed(fn):
-        t0 = time.time()
-        return fn(), time.time() - t0
+    locks = {name: threading.Lock() for name, _, _ in selected}   # mesma loja (M e F): uma de cada vez
+
+    def timed(fn, lock):
+        with lock:
+            t0 = time.time()
+            return fn(), time.time() - t0
 
     # coleta em PARALELO (cada loja num fio); o envio dos alertas continua em ordem, um por vez
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=int(os.environ.get("RADAR_WORKERS", "8"))) as ex:
-        futures = [ex.submit(timed, fn) for _, _, fn in selected]
+        futures = [ex.submit(timed, fn, locks[name]) for name, _, fn in selected]
     print(f"  (coleta paralela de {len(selected)} lojas em {time.time() - t_start:.0f}s)", flush=True)
 
     for (name, g, fn), fut in zip(selected, futures):
